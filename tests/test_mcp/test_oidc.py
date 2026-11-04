@@ -7,7 +7,12 @@ enforcement is tested separately in
 test_http_app.py::TestOidcTokenRequired.
 """
 
+import http.server
+import threading
+from unittest.mock import patch
+
 import pytest
+import requests
 
 from trac_mcp_server.config import Config
 from trac_mcp_server.mcp.oidc import (
@@ -170,3 +175,73 @@ class TestOidcClientCache:
         # The earliest tokens were evicted first.
         assert "token-0" not in cache._clients
         assert f"token-{_MAX_CACHED_CLIENTS + 9}" in cache._clients
+
+
+class _Hello(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *_args):
+        pass
+
+
+class TestEviction:
+    def _session_in_new_thread(self, client) -> requests.Session:
+        sessions = []
+        worker = threading.Thread(
+            target=lambda: sessions.append(client.session)
+        )
+        worker.start()
+        worker.join()
+        return sessions[0]
+
+    def test_evicting_a_client_closes_the_sessions_of_all_its_threads(
+        self, base_config
+    ):
+        cache = OidcClientCache(base_config, "https://example.com/rpc")
+        with patch("trac_mcp_server.mcp.oidc._MAX_CACHED_CLIENTS", 1):
+            evicted = cache.get_client("first")
+            sessions = [
+                evicted.session,
+                self._session_in_new_thread(evicted),
+            ]
+            assert sessions[0] is not sessions[1]
+            with patch.object(requests.Session, "close") as close:
+                cache.get_client("second")
+        assert close.call_count == 2
+
+    def test_a_client_that_stays_cached_is_not_closed(
+        self, base_config
+    ):
+        cache = OidcClientCache(base_config, "https://example.com/rpc")
+        _ = cache.get_client("first").session
+        with patch.object(requests.Session, "close") as close:
+            cache.get_client("second")
+            cache.get_client("first")
+        close.assert_not_called()
+
+    def test_a_closed_client_can_still_finish_its_work(
+        self, base_config
+    ):
+        """A call may still be running on the client when it is evicted."""
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), _Hello
+        )
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True
+        )
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/rpc"
+        try:
+            client = OidcClientCache(base_config, url).get_client(
+                "token"
+            )
+            assert client.session.get(url, timeout=5).status_code == 200
+            client.close()
+            assert client.session.get(url, timeout=5).status_code == 200
+        finally:
+            server.shutdown()
+            server.server_close()

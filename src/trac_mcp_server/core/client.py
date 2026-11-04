@@ -3,6 +3,7 @@ import calendar
 import socket
 import threading
 import time
+import weakref
 import xmlrpc.client
 from datetime import datetime
 from email.utils import parsedate_to_datetime
@@ -146,6 +147,10 @@ class TracClient:
     def __init__(self, config: Config):
         self.config = config
         self._thread_local = threading.local()
+        self._sessions: weakref.WeakSet[requests.Session] = (
+            weakref.WeakSet()
+        )
+        self._sessions_lock = threading.Lock()
         self.rpc_url = self._get_rpc_url()
 
     @property
@@ -166,8 +171,23 @@ class TracClient:
     def _get_session(self) -> requests.Session:
         """Get or create a thread-local requests.Session."""
         if not hasattr(self._thread_local, "session"):
-            self._thread_local.session = self._create_session()
+            session = self._create_session()
+            with self._sessions_lock:
+                self._sessions.add(session)
+            self._thread_local.session = session
         return self._thread_local.session
+
+    def close(self) -> None:
+        """Drop the pooled connections of every thread's session.
+
+        A session stays usable after close(): the next request opens a new
+        connection. So a call still running on this client, in another
+        thread, is not broken by it.
+        """
+        with self._sessions_lock:
+            sessions = list(self._sessions)
+        for session in sessions:
+            session.close()
 
     def _create_session(self) -> requests.Session:
         session = requests.Session()
