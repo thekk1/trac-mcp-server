@@ -20,7 +20,7 @@ and still maintained. They are reached from three places:
 
 | Consumer | What it converts |
 |----------|------------------|
-| `trac-convert` (standalone binary) | Either direction, on files or stdin |
+| `trac-convert` (standalone binary) | Markdown -> TracWiki offline; TracWiki -> Markdown through Trac's rendered HTML (needs a Trac connection) |
 | `convert_preview` (MCP tool) | Markdown -> TracWiki, without writing |
 | `wiki_file_push` / `wiki_file_pull` | Markdown <-> TracWiki, driven by the file's extension |
 
@@ -37,7 +37,7 @@ on, which the inline tools do not.
 | `ticket_get` / `ticket_changelog` | TracWiki | TracWiki | **None** -- returned byte-for-byte |
 | `milestone_*` | TracWiki | TracWiki | **None** -- byte-for-byte both ways |
 | `wiki_file_push` | Markdown or TracWiki | TracWiki | Converts when the source is Markdown |
-| `wiki_file_pull` | TracWiki | Markdown or TracWiki | Converts when the target is Markdown |
+| `wiki_file_pull` | TracWiki | Markdown or TracWiki | For Markdown, Trac's rendered HTML for the page, translated: a one-way export (see below) |
 | `convert_preview` | Markdown | TracWiki | Converts, without writing anything |
 
 ## Holding Markdown?
@@ -60,6 +60,101 @@ extension:
   }
 }
 ```
+
+## TracWiki to Markdown: Trac's own HTML
+
+Since Trac /trac_mcp_server #210, TracWiki -> Markdown is not a text
+conversion. Trac renders the page (or the text) to HTML and the
+translator (`trac_html_to_markdown`) turns that HTML into Markdown, so
+macros, nested lists, tables and links come out as Trac itself reads them.
+
+- **`wiki_file_pull`** with `format="markdown"` reads the page's version
+  first, then the source and the HTML *at that version*, so an edit landing
+  between the reads cannot pair one version's HTML with another's source.
+- **`trac-convert`** asks Trac to render the input (`wiki.wikiToHtml`) for
+  files, stdin and the clipboard; for `--from-wiki PAGE` it uses the page's
+  own HTML (`wiki.getPageHTML`), so relative links resolve. It needs a
+  Trac connection: with none configured it exits `4`. Markdown -> TracWiki
+  stays offline.
+- Trac's HTML does not say which language a code block was, so each block is
+  paired with the `{{{#!lang` opener of the TracWiki source and fenced with
+  that language.
+- The result is a one-way export for reading. It is not meant to be pushed
+  back: a Markdown file pulled this way is Trac's rendering, not the source,
+  and its front matter makes the guarded push paths refuse it (see below). Pull
+  `format="tracwiki"` for the source itself, which you can edit and push
+  back.
+- Warnings the translator raises (a dropped table of contents, a table
+  passed through as HTML, a list style Markdown cannot express) are listed
+  in the text block of the `wiki_file_pull` result and in
+  `structuredContent.warnings`, and as `warning:` lines on stderr from
+  `trac-convert`.
+
+### Front matter on an export
+
+Every Markdown export of a Trac page starts with a YAML front matter block
+(Trac /trac_mcp_server #212): `wiki_file_pull` with `format="markdown"`
+(inline or to a file), `trac-mcp wiki-pull`, and `trac-convert --from-wiki
+PAGE --to md` (to stdout, `-o` or the clipboard). Text, file and clipboard
+input to `trac-convert` never gets one -- there is no page to name.
+
+```yaml
+---
+title: "Blog Post"
+source: "http://host/proj/wiki/Blog/Post"
+trac_instance: "/proj"
+trac_page: "Blog/Post"
+trac_version: 7
+exported: "2026-11-09T12:00:00Z"
+---
+```
+
+| Field | Where the value comes from |
+|-------|----------------------------|
+| `title` | The text of the first `h1` of Trac's HTML, without Trac's anchor and icon marks, whitespace collapsed; the page name when there is no `h1` |
+| `source` | The page's own URL, `<trac_url>/wiki/<page>`, with the page name percent-encoded (`Notes/Q3 #2` is `Notes/Q3%20%232`) |
+| `trac_instance` | The path of the Trac URL (`/proj` for `http://host/proj`, `/` for a URL with no path) |
+| `trac_page` | The page name as asked for |
+| `trac_version` | The version the source and the HTML were read at; `null` when it could not be read and none was requested |
+| `exported` | The UTC time of the export, `YYYY-MM-DDTHH:MM:SSZ` |
+
+Strings are written as JSON strings, which are valid YAML double-quoted
+scalars, so a title with a colon, a quote or non-ASCII text parses back
+exactly (non-ASCII is written as is; the few characters YAML cannot carry
+raw, such as DEL, the C1 controls and U+2028, are written as `\uXXXX`).
+
+**It is a guard.** The export is one-way, so the guarded paths --
+`wiki_file_push`, `trac-mcp wiki-push` and `trac-convert` to TracWiki --
+refuse Markdown whose front matter is a YAML mapping carrying a non-empty
+`trac_page`, unless forced:
+
+- `wiki_file_push` returns a `validation_error` naming the page, instance
+  and version, and stores nothing; `force=true` overrides it (a client
+  that predates the guard has no `force` and does not refuse either).
+  `trac-mcp wiki-push` takes `--force`.
+- `trac-convert` exits `1` with one `trac-convert: refusing to convert: ...`
+  line on stderr when Markdown with that front matter is converted to
+  TracWiki (`--to tracwiki`, or `--to-wiki`, which writes nothing to Trac);
+  `--force` strips the front matter and converts the rest. Converting to
+  Markdown, or Markdown with front matter that has no `trac_page`, is
+  untouched.
+
+Edit such a page as TracWiki instead (`wiki_get`, `trac-mcp wiki-pull
+PAGE FILE --format tracwiki`, `trac-convert --from-wiki PAGE --to
+tracwiki`). The guard is for the accidental pull-edit-push loop, not for a
+determined user: deleting the front matter by hand defeats it, and that is
+accepted. Connected MCP sessions keep the old `wiki_file_push` schema (no
+`force`) until they reconnect. `wiki_update` and `wiki_create` store their
+content verbatim as TracWiki and do not check front matter (they never
+convert, so they cannot re-shape a page; Markdown written there is stored
+as literal text).
+
+There is no offline TracWiki -> Markdown conversion: the old regex
+converter, `tracwiki_to_markdown`, is removed (Trac /trac_mcp_server #214).
+`auto_convert` raises `ValueError` ("TracWiki -> Markdown needs Trac's
+rendered HTML: use trac_html_to_markdown") for a TracWiki source with a
+Markdown target, rather than passing the text through. The "Markup
+Conversion Examples" below describe the Markdown -> TracWiki direction.
 
 ## ConversionResult Structure
 
@@ -95,20 +190,12 @@ The converter detects potentially lossy conversions and returns warnings:
 - HTML tags (may not render correctly)
 - TOC macros (use `[[PageOutline]]` instead)
 
-**TracWiki to Markdown:**
-- Unknown macros (preserved as `[MACRO: Name]` notation) -- only genuine
-  macro names (a fixed allowlist of Trac's built-ins, e.g. `TOC`,
-  `PageOutline`, `RecentChanges`) or `[[Name(args)]]` forms carrying explicit
-  arguments are treated as macros. A bare `[[PageName]]` or
-  `[[PageName|Label]]` is a WikiLink and converts to a real Markdown link
-  instead (see Links below) -- unrecognized macro names from third-party
-  plugins that take no arguments will be misread as links, since the
-  converter has no access to the live Trac instance's macro registry.
-- Definition lists (converted to bold text)
-- Table cell spanning (merged into single cell)
-- Multi-line table rows (joined into single line)
-- Processor-based table cells (converted to plain text)
-- TracLinks (preserved but not clickable)
+**TracWiki to Markdown:** the translator's warnings name every lossy
+mapping, each once (Trac #209). They are not a fixed list: anything it does
+not cover passes through as HTML with a warning that names it, so nothing is
+lost silently. Examples: a dropped table of contents, a table with
+`colspan`/`rowspan` cells, a lettered list exported as a numbered list,
+code blocks with no matching source block.
 
 ## Markup Conversion Examples
 
@@ -182,25 +269,16 @@ TracWiki:  [wiki:WikiPage Wiki Link]
 
 Markdown:  [Wiki Link](wiki:WikiPage)
 TracWiki:  [wiki:WikiPage Wiki Link]
-
-TracWiki:  [[WikiPage]]
-Markdown:  [WikiPage](wiki:WikiPage)
-
-TracWiki:  [[WikiPage|Wiki Link]]
-Markdown:  [Wiki Link](wiki:WikiPage)
 ```
 
-> **Note:** Double-bracket `[[WikiPage]]` / `[[WikiPage|Label]]` links only
-> ever appear on the TracWiki-to-Markdown side; `markdown_to_tracwiki`
-> always emits the single-bracket `[wiki:WikiPage ...]` form shown above, so
-> a `wiki_get` -> edit -> `wiki_update` round-trip normalizes double-bracket
-> links to single-bracket ones rather than preserving the original syntax.
+> **Note:** Double-bracket `[[WikiPage]]` / `[[WikiPage|Label]]` written in
+> the Markdown source is TracWiki macro/link syntax and passes through
+> unchanged; `markdown_to_tracwiki`'s own link output is always the
+> single-bracket `[wiki:WikiPage ...]` form shown above.
 
-> **Note:** Link targets that already carry a TracLink resolver prefix -- `wiki:`, `ticket:`, `milestone:`, `source:`, `attachment:`, `changeset:`, and the rest of Trac's built-in resolvers -- are emitted verbatim, not prefixed a second time. This is the form `tracwiki_to_markdown` produces, so a `wiki_get` -> edit -> `wiki_update` round-trip that leaves existing links untouched preserves them exactly. Targets without a prefix (`WikiPage`, `Planning/Phases/Phase01`) get `wiki:` added.
+> **Note:** Link targets that already carry a TracLink resolver prefix -- `wiki:`, `ticket:`, `milestone:`, `source:`, `attachment:`, `changeset:`, and the rest of Trac's built-in resolvers -- are emitted verbatim, not prefixed a second time. Targets without a prefix (`WikiPage`, `Planning/Phases/Phase01`) get `wiki:` added.
 
-> **Note:** Non-URL-shaped "links" (URL portion contains a `:` that is not a known TracLink resolver, e.g. sentinel tokens like `[auto-pm: state NEEDS_CODE]` or `[label](foo:bar)`) are emitted verbatim as Markdown rather than wrapped as TracWiki wiki links. This preserves machine-readable state markers through round-trip conversion.
-
-> **Note:** The same rule applies in the TracWiki -> Markdown direction. A `[target label]` construct is only rewritten as a Markdown link when `target` is a real link target -- a known TracLink resolver, a URL scheme, or a name with no `:` at all. Bracketed prose such as `[auto-pm: state NEEDS_EDIT]` or `[note: see below]` stays literal instead of becoming `[state NEEDS_EDIT](auto-pm:)` with an empty URL. A construct also never spans a line break, so an orphan `[text]` cannot absorb a `(...)` parenthetical from a following line.
+> **Note:** Non-URL-shaped "links" (URL portion contains a `:` that is not a known TracLink resolver, e.g. sentinel tokens like `[auto-pm: state NEEDS_CODE]` or `[label](foo:bar)`) are emitted verbatim as Markdown rather than wrapped as TracWiki wiki links. This keeps machine-readable state markers intact.
 
 **Images:**
 ```
@@ -221,21 +299,19 @@ TracWiki:   * Item 1
 
 **Macros:**
 ```
-Markdown:  [MACRO: PageOutline]
+Markdown:  [[PageOutline]]
 TracWiki:  [[PageOutline]]
 
-Markdown:  [MACRO: TOC(depth=2)]
+Markdown:  [[TOC(depth=2)]]
 TracWiki:  [[TOC(depth=2)]]
 
 Markdown:  [[SomePage]]
 TracWiki:  [[SomePage]]
 ```
 
-> **Note:** `[MACRO: Name(args)]` -- the placeholder `tracwiki_to_markdown`
-> emits for a macro it couldn't otherwise represent in Markdown -- converts
-> back to `[[Name(args)]]`, so a `wiki_get` -> edit -> `wiki_update` round
-> trip no longer permanently flattens the macro (ticket #19). `[[...]]`
-> syntax typed directly in the Markdown source passes through unchanged too.
+> **Note:** `[[...]]` syntax typed directly in the Markdown source passes
+> through unchanged (ticket #19), so a macro keeps working in the TracWiki
+> that is stored.
 
 **CamelCase words:**
 ```

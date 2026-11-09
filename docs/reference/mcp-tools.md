@@ -1288,6 +1288,9 @@ The version named is the page's current version, re-read after the no-op, so whe
 | `comment` | string | No | `""` | Change comment |
 | `format` | string | No | `"auto"` | Source format override: `auto`, `markdown`, or `tracwiki`. Default auto-detects from extension then content |
 | `strip_frontmatter` | boolean | No | `true` | Strip YAML frontmatter from .md files before pushing |
+| `force` | boolean | No | `false` | Push Markdown whose front matter says it was exported from Trac (carries `trac_page`). Without it such a push is refused: the Markdown export is one-way |
+
+**Refuses exported Markdown (Trac /trac_mcp_server #212).** A Markdown pull (`wiki_file_pull`, `trac-mcp wiki-pull`, `trac-convert --from-wiki ... --to md`) starts with YAML front matter naming its page. `wiki_file_push` reads the text first and, if its front matter is a YAML mapping with a non-empty string `trac_page`, returns a `validation_error` and stores nothing (no Trac call is made): `Refusing to push: this Markdown was exported from Trac page 'P' (instance /proj, version 7); the Markdown export is one-way and pushing it back would re-shape the page.` The action says to edit the page as TracWiki (`wiki_get`, or `trac-mcp wiki-pull P FILE --format tracwiki`) or to pass `force=true`. The check looks at the text only: it does not depend on `format` or `strip_frontmatter`, and it applies to `file_path` input as well. With `force=true` the push proceeds as it always did (the front matter is stripped by `strip_frontmatter` like any other). Front matter without `trac_page` (a Hugo-style `title` / `date`, say) is not refused. Deleting the front matter by hand defeats the guard; that is accepted -- it is there for the accidental pull-edit-push loop, not against a determined user. **Connected MCP sessions keep the old `wiki_file_push` schema (no `force`) until they reconnect**; a daemon that predates the guard neither refuses nor knows `force`.
 
 **Success Response:**
 ```json
@@ -1371,7 +1374,7 @@ The version named is the page's current version, re-read after the no-op, so whe
 
 ## wiki_file_pull
 
-**Description:** Pull a Trac wiki page, converted to the requested format. Where the server's `file_access` is `off` (the http default) the text comes back in `structuredContent.content` and a `file_path` is refused; where it is `local`, `file_path` -- on the **server's** filesystem -- is required, as before. To save a page on your own machine, use `trac-mcp wiki-pull PAGE FILE` there.
+**Description:** Pull a Trac wiki page, converted to the requested format. Markdown is Trac's own rendered HTML for the page translated to Markdown: a one-way export, not meant to be pushed back, that starts with YAML front matter (`title`, `source`, `trac_instance`, `trac_page`, `trac_version`, `exported`; `wiki_file_push` refuses that text unless `force=true`); `format="html"` is Trac's render as a complete minimal HTML document (links absolute, no CSS); `format="tracwiki"` returns the stored source verbatim. Translator warnings come back in `structuredContent.warnings` (always a list). `link_rewrites` (`{from, to}` URL-prefix rules, longest prefix first) rewrites the links -- never the images or in-page `#anchors` -- of a Markdown pull: given, it replaces the server's configured map (`[]` = no rewriting); omitted, the configured map applies. `structuredContent.link_rewrites_source` says which was used (`call`, `config` or `none`). Where the server's `file_access` is `off` (the http default) the text comes back in `structuredContent.content` and a `file_path` is refused; where it is `local`, `file_path` -- on the **server's** filesystem -- is required, as before. To save a page on your own machine, use `trac-mcp wiki-pull PAGE FILE` there.
 
 **Parameters:**
 
@@ -1379,8 +1382,9 @@ The version named is the page's current version, re-read after the no-op, so whe
 |------|------|----------|---------|-------------|
 | `page_name` | string | **Yes** | - | Wiki page name to pull |
 | `file_path` | string | With `local` | - | Absolute output path on the **server's** filesystem: required where `file_access` is `local`, refused where it is `off` |
-| `format` | string | No | `"markdown"` | Output format: `markdown` or `tracwiki` |
+| `format` | string | No | `"markdown"` | Output format: `markdown` (Trac's render translated to Markdown), `html` (Trac's render, unchanged, as a complete minimal HTML document: `<!doctype html>`, `<meta charset="utf-8">`, `<title>` the escaped page name, the fragment as `<body>`; links absolute, no CSS) or `tracwiki` (the stored source). The `html` read is pinned to the page's current version the same way the `markdown` one is, and reads no source |
 | `version` | integer | No | *(latest)* | Specific page version to pull (minimum: 1) |
+| `link_rewrites` | array of `{from, to}` | No | *(the server's configured map)* | Link-rewrite rules for `format=markdown`: a link target starting with `from` (non-empty string) has that prefix replaced by `to` (string), the longest `from` first. Replaces the configured map for this call; `[]` disables rewriting. Image sources and in-page `#anchors` are never rewritten. The input schema refuses an empty `from`, a non-string value, a missing key and any extra key in a rule (before the handler runs, as an input validation error); the handler's own `validation_error`, returned before Trac is read, covers a duplicate `from`. For `format=html` and `format=tracwiki` the handler ignores the argument (it is not validated), though the schema still applies |
 
 **Success Response:**
 ```json
@@ -1397,12 +1401,14 @@ The version named is the page's current version, re-read after the no-op, so whe
   "format": "markdown",
   "version": 3,
   "converted": true,
+  "warnings": [],
+  "link_rewrites_source": "none",
   "content": "# Design\n...",
   "bytes": 4521
 }
 ```
 
-With a `file_path` (where `file_access` is `local`), `content`/`bytes` are replaced by `file_path` and `bytes_written`.
+`link_rewrites_source` is `call` when the call passed `link_rewrites` (even `[]`), `config` when the server's configured map (`export.link_rewrites` / `TRAC_MCP_LINK_REWRITES`, see [Configuration](configuration.md#link-rewrites-export)) was applied, and `none` when no map was in force -- always `none` for `format=html` and `format=tracwiki`. `warnings` lists what the translator could not map exactly; it is `[]` for `format=tracwiki`, for `format=html` unless its version could not be read, and when nothing was lossy. The same warnings follow the summary line in the text block under `Conversion warnings:`. With a `file_path` (where `file_access` is `local`), `content`/`bytes` are replaced by `file_path` and `bytes_written`.
 
 **Error Responses:**
 
@@ -1423,10 +1429,14 @@ With a `file_path` (where `file_access` is `local`), `content`/`bytes` are repla
   ```
 
 **Implementation Notes:**
-- Converts TracWiki to Markdown by default; use `format: "tracwiki"` to get raw content
+- A Markdown pull (inline or to `file_path`) starts with a front matter block, then one blank line, then the translated page. `title` is the text of the page's first heading (Trac's anchor and icon decorations left out; the page name when there is none), `source` the page's own URL, `trac_instance` the path of the instance's URL (`/proj`; `/` for a URL with no path), `trac_page` the page name, `trac_version` the pinned version (`null` when it could not be read and none was asked for) and `exported` the UTC time of the pull. Strings are double-quoted YAML scalars. `format=html` and `format=tracwiki` output has none. `bytes` and `bytes_written` count the front matter. See [Format Conversion](format-conversion.md#front-matter-on-an-export)
+- Link rewriting touches `href`s only (including those inside raw HTML the translator passes through); image `src`s are never changed, a link into the page itself with a fragment (`<trac_url>/wiki/<page>#Heading`, how Trac renders `[#Heading x]`) is written `#Heading` and never rewritten, and the link text is kept, so an autolink whose target is rewritten becomes `[original URL](new URL)`
+- Markdown by default: Trac's rendered HTML for the page, translated (`wiki.getPageHTML`/`getPageHTMLVersion`), with code-block languages taken from the TracWiki source; use `format: "tracwiki"` to get raw content (no HTML is read)
+- For Markdown, the page's version is read first (`getPageInfo`) and the source and the HTML are fetched at that version, so a concurrent edit cannot mix versions
+- `format: "html"` reads the version first too and fetches only the HTML at it (`getPageHTML`/`getPageHTMLVersion`; no source is read); `converted` is `true` (it is not the stored source). If the version cannot be read the HTML is the latest and `warnings` says it was not pinned
 - An inline result over the server's `max_inline_bytes` (default 5 MiB) is refused with a `validation_error`
 - Parent directory of `file_path` must exist, and is checked before Trac is called
-- Fetches page info separately for version metadata
+- Fetches page info separately for version metadata. For `markdown` and `html` it is read first and the HTML (and, for `markdown`, the source) is fetched at that version; `html` reads no source. For `tracwiki` it is read after the source. The reported `version` is the info's when usable, else the requested `version`, else `1` (an unpinned read of an instance whose info answer is unusable, which also adds a `warnings` entry for `markdown` and `html`)
 
 **Example Call:**
 ```json

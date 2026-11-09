@@ -1386,128 +1386,6 @@ def test_get_wiki_page_info_success(mock_post, mock_config):
 
 
 @patch("trac_mcp_server.core.client.requests.Session.post")
-def test_get_wiki_page_with_metadata_success(mock_post, mock_config):
-    """Test get_wiki_page_with_metadata combining content and metadata."""
-    # First response for getPage
-    get_response = Mock()
-    get_response.status_code = 200
-    get_response.content = b"""<?xml version="1.0"?>
-<methodResponse>
-  <params>
-    <param>
-      <value><string>= Wiki Content =</string></value>
-    </param>
-  </params>
-</methodResponse>"""
-
-    # Second response for getPageInfo
-    info_response = Mock()
-    info_response.status_code = 200
-    info_response.content = b"""<?xml version="1.0"?>
-<methodResponse>
-  <params>
-    <param>
-      <value>
-        <struct>
-          <member>
-            <name>name</name>
-            <value><string>TestPage</string></value>
-          </member>
-          <member>
-            <name>author</name>
-            <value><string>john</string></value>
-          </member>
-          <member>
-            <name>version</name>
-            <value><int>5</int></value>
-          </member>
-          <member>
-            <name>lastModified</name>
-            <value><int>1234567890</int></value>
-          </member>
-        </struct>
-      </value>
-    </param>
-  </params>
-</methodResponse>"""
-
-    mock_post.side_effect = [get_response, info_response]
-
-    client = TracClient(mock_config)
-    result = client.get_wiki_page_with_metadata("TestPage")
-
-    # Verify combined result
-    assert result["name"] == "TestPage"
-    assert result["content"] == "= Wiki Content ="
-    assert result["version"] == 5
-    assert result["author"] == "john"
-    assert result["lastModified"] == 1234567890
-
-    # Verify both calls made
-    assert mock_post.call_count == 2
-
-
-@patch("trac_mcp_server.core.client.requests.Session.post")
-def test_get_wiki_page_with_metadata_not_found_with_suggestions(
-    mock_post, mock_config
-):
-    """Test get_wiki_page_with_metadata with suggestions on not found."""
-    # First response for getPage (fault)
-    fault_response = Mock()
-    fault_response.status_code = 200
-    fault_response.content = b"""<?xml version="1.0"?>
-<methodResponse>
-  <fault>
-    <value>
-      <struct>
-        <member>
-          <name>faultCode</name>
-          <value><int>1</int></value>
-        </member>
-        <member>
-          <name>faultString</name>
-          <value><string>No such page</string></value>
-        </member>
-      </struct>
-    </value>
-  </fault>
-</methodResponse>"""
-
-    # Second response for getAllPages
-    pages_response = Mock()
-    pages_response.status_code = 200
-    pages_response.content = b"""<?xml version="1.0"?>
-<methodResponse>
-  <params>
-    <param>
-      <value>
-        <array>
-          <data>
-            <value><string>WikiStart</string></value>
-            <value><string>TestPage</string></value>
-            <value><string>TestPageTwo</string></value>
-          </data>
-        </array>
-      </value>
-    </param>
-  </params>
-</methodResponse>"""
-
-    mock_post.side_effect = [fault_response, pages_response]
-
-    client = TracClient(mock_config)
-
-    with pytest.raises(ValueError) as exc_info:
-        client.get_wiki_page_with_metadata("Test")
-
-    # Verify error message includes suggestions
-    error_msg = str(exc_info.value)
-    assert "Page 'Test' not found" in error_msg
-    assert "Similar pages:" in error_msg
-    assert "TestPage" in error_msg
-
-
-@patch("trac_mcp_server.core.client.requests.Session.post")
 def test_search_wiki_pages_by_title(mock_post, mock_config):
     """Test search_wiki_pages_by_title method."""
     mock_response = Mock()
@@ -2268,6 +2146,144 @@ def test_put_wiki_page_other_precheck_fault_propagates(
         "wiki.putPageIfVersion",
         "wiki.getPageInfo",
     ]
+
+
+@patch("trac_mcp_server.core.client.requests.Session.post")
+def test_put_wiki_page_real_404_precheck_fault_is_a_conflict(
+    mock_post, mock_config
+):
+    """TracXMLRPC's real missing-page fault, Fault(404, 'Wiki page "X"
+    does not exist'), is classified by its code: the page is absent
+    (Trac #191)."""
+    mock_post.side_effect = [
+        _method_not_found_response(),
+        _fault_response('Wiki page "Page" does not exist', code=404),
+    ]
+
+    client = TracClient(mock_config)
+    with pytest.raises(WikiPageConflict) as exc_info:
+        client.put_wiki_page("Page", "content", "comment", version=1)
+
+    assert exc_info.value.current_version is None
+    assert "the page does not exist" in str(exc_info.value)
+    assert _posted_methods(mock_post) == [
+        "wiki.putPageIfVersion",
+        "wiki.getPageInfo",
+    ]
+
+
+@patch("trac_mcp_server.core.client.requests.Session.post")
+def test_put_wiki_page_code_1_quoted_name_precheck_fault_is_not_absence(
+    mock_post, mock_config
+):
+    """A code-1 fault is any TracError, and the name it quotes,
+    'Not Found Notes', is no evidence that the page is missing: the
+    pre-check re-raises it instead of reporting a conflict, and
+    putPage is never posted (Trac #191)."""
+    mock_post.side_effect = [
+        _method_not_found_response(),
+        _fault_response(
+            "'Invalid Wiki page name 'Not Found Notes'' while "
+            "executing 'wiki.getPageInfo()'"
+        ),
+    ]
+
+    client = TracClient(mock_config)
+    with pytest.raises(xmlrpc.client.Fault) as exc_info:
+        client.put_wiki_page(
+            "Not Found Notes", "content", "comment", version=1
+        )
+
+    assert not isinstance(exc_info.value, WikiPageConflict)
+    assert exc_info.value.faultCode == 1
+    assert _posted_methods(mock_post) == [
+        "wiki.putPageIfVersion",
+        "wiki.getPageInfo",
+    ]
+
+
+@patch("trac_mcp_server.core.client.requests.Session.post")
+def test_put_wiki_page_precheck_fault_is_re_raised_unwrapped(
+    mock_post, mock_config
+):
+    """The pre-check's fault is re-raised like putPage's: TracXMLRPC's
+    "while executing" wrapper removed, the fault code kept (Trac
+    #191)."""
+    mock_post.side_effect = [
+        _method_not_found_response(),
+        _fault_response(
+            "'Invalid Wiki page name 'Not Found Notes'' while "
+            "executing 'wiki.getPageInfo()'"
+        ),
+    ]
+
+    client = TracClient(mock_config)
+    with pytest.raises(xmlrpc.client.Fault) as exc_info:
+        client.put_wiki_page(
+            "Not Found Notes", "content", "comment", version=1
+        )
+
+    assert exc_info.value.faultCode == 1
+    assert "while executing" not in exc_info.value.faultString
+    assert (
+        exc_info.value.faultString
+        == "Invalid Wiki page name 'Not Found Notes'"
+    )
+
+
+@patch("trac_mcp_server.core.client.requests.Session.post")
+def test_get_recent_wiki_changes_falls_back_on_a_missing_method(
+    mock_post, mock_config
+):
+    """A real MethodNotFound (-32601) for wiki.getRecentChanges falls
+    back to listing the pages (Trac #191)."""
+    mock_post.side_effect = [
+        _method_not_found_response("wiki.getRecentChanges")
+    ]
+    client = TracClient(mock_config)
+    with patch.object(
+        client, "list_wiki_pages", return_value=[]
+    ) as listed:
+        assert client.get_recent_wiki_changes() == []
+
+    listed.assert_called_once_with()
+
+
+@patch("trac_mcp_server.core.client.requests.Session.post")
+def test_get_recent_wiki_changes_falls_back_on_an_unprefixed_fault(
+    mock_post, mock_config
+):
+    """A server whose text omits the service prefix ("No such method:
+    getRecentChanges", code 1) still counts as a missing method (Trac
+    #191)."""
+    mock_post.side_effect = [
+        _fault_response("No such method: getRecentChanges")
+    ]
+    client = TracClient(mock_config)
+    with patch.object(
+        client, "list_wiki_pages", return_value=[]
+    ) as listed:
+        assert client.get_recent_wiki_changes() == []
+
+    listed.assert_called_once_with()
+
+
+@patch("trac_mcp_server.core.client.requests.Session.post")
+def test_get_recent_wiki_changes_resource_fault_is_not_a_missing_method(
+    mock_post, mock_config
+):
+    """A fault whose text says "not found" is not a missing method: it
+    is re-raised and the listing fallback is not tried (Trac #191)."""
+    mock_post.side_effect = [
+        _fault_response("Wiki page 'Not Found Notes' not found")
+    ]
+    client = TracClient(mock_config)
+    with patch.object(client, "list_wiki_pages") as listed:
+        with pytest.raises(xmlrpc.client.Fault) as exc_info:
+            client.get_recent_wiki_changes()
+
+    assert exc_info.value.faultCode == 1
+    listed.assert_not_called()
 
 
 @patch("trac_mcp_server.core.client.requests.Session.post")

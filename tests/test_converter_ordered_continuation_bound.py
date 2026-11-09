@@ -15,46 +15,24 @@ preview format=tracwiki`, render only; ticket #178 comment 1):
   quotes are not held to the bound; a `{{{` block joins at any indent
   (#144), and so does the `{{{#!div}}}` that carries a table.
 
-The change, in two legs:
-
-* Write leg: for an ordered marker, a TEXT continuation (a soft-break or
-  loose-paragraph line, a plain text run, the `rest` lines of a #176
-  "between" paragraph) goes at `min(len(prefix) + 1, bound)`, `bound` being
-  `trac_continuation_bound`, and only while no EMPTY line has ended the list
-  (a run after one keeps the text column). A
-  quote child, a code child and a table child keep the text column, and
-  bullets are unchanged (`len(prefix) + 1` is already `m + 2`, their bound).
-* Read leg: a line that continues the INNERMOST item, deeper than its marker
-  and no deeper than Trac's bound for it, is re-indented to the item's
-  Markdown text column when that column is past the bound (ordered items 10
-  or more, or a wider gap after the marker), unless a blank line has passed
-  since the marker (a raw whitespace-only line is one; only the line
-  `[[BR]]` made is not). Without it ` 10. j` / `    a [[BR]][[BR]]` / `    b` read
-  back with `b` at column 4: after the blank line `[[BR]][[BR]]` becomes,
-  CommonMark leaves the item and `b` is an indented code block.
-
-The read-leg rule is narrow on purpose (the operator's decision, ticket #178
-comment 2): a bullet continued at column 2, or an item 1-9 continued at column
-2 or 3, after a `[[BR]][[BR]]` has the same problem, but the converter never
-writes those shapes, so they are pinned to `master`'s bytes here (WIDER).
-Nested list MARKER lines are #179's and are not asserted.
+The write leg puts, for an ordered marker, a TEXT continuation (a soft-break
+or loose-paragraph line, a plain text run, the `rest` lines of a #176
+"between" paragraph) at `min(len(prefix) + 1, bound)`, `bound` being
+`trac_continuation_bound`, and only while no EMPTY line has ended the list (a
+run after one keeps the text column). A quote child, a code child and a table
+child keep the text column, and bullets are unchanged (`len(prefix) + 1` is
+already `m + 2`, their bound).
 """
+
+from html.parser import HTMLParser
 
 import pytest
 
-from tests.test_converter_list_marker_column import _structure
 from trac_mcp_server.converters.markdown_to_tracwiki import (
     markdown_to_tracwiki,
 )
-from trac_mcp_server.converters.tracwiki_to_markdown import (
-    tracwiki_to_markdown,
-)
 
 # -- builders -------------------------------------------------------------
-
-
-def _read(tracwiki: str) -> str:
-    return tracwiki_to_markdown(tracwiki).text
 
 
 def _tail(text: str, marker: str) -> str:
@@ -93,23 +71,6 @@ def _md_list(
         else:
             lines.append(text_col + line if line else "")
     lines.append(f"{pad}{next_token} k")
-    return "\n".join(lines) + "\n"
-
-
-def _tw_list(
-    number: int, depth: int, column: int, body: list[str]
-) -> str:
-    """TracWiki for an ordered item `j` numbered `number`, `body` lines at
-    `column` under it (a line starting with a space keeps it), then `k`.
-    At depth 1 the list is nested under ` * a` with filler items."""
-    lines: list[str] = []
-    ind = " " * (2 * depth + 1)
-    if depth:
-        lines.append(" * a")
-        lines += [f"   {i}. x" for i in range(1, number)]
-    lines.append(f"{ind}{number}. j")
-    lines += [" " * column + line if line else "" for line in body]
-    lines.append(f"{ind}{number + 1}. k")
     return "\n".join(lines) + "\n"
 
 
@@ -243,8 +204,8 @@ class TestWriteLegNoCapAfterABlankSeparator:
     """Review fix 1 (#178): the marker + 3 cap holds only while no EMPTY line
     separates the run from the item. After one Trac has already ended the
     list, so the run keeps `master`'s text-column indent (`continuation_
-    indent`); capping it moved it into column 4, where the read leg then
-    reads a line of the NEXT list's body and fenced the heading."""
+    indent`); capping it would move it into column 4, a line of the NEXT
+    list's body."""
 
     def _write(self, number, depth, body):
         out = markdown_to_tracwiki(
@@ -352,14 +313,13 @@ class TestWriteLegNoCapAfterABlankSeparator:
         )
 
 
-def test_the_blank_separator_repro_round_trips_stably():
-    """MD -> TW -> MD -> TW for the review's repro: a heading after a blank
-    line under item 10. On the first round-one branch the second trip turned
-    the heading into a `{{{` block."""
+def test_the_blank_separator_repro_is_written_with_the_heading_in_the_item():
+    """The review's repro: a heading after a blank line under item 10 is
+    written at the item's continuation indent, the next item right after."""
     md = "10. j\n\n    # h\n\n    after\n11. k\n"
-    first = markdown_to_tracwiki(md)
-    assert first == " 10. j\n\n     = h =\n     after\n 11. k"
-    assert markdown_to_tracwiki(_read(first)) == first
+    assert markdown_to_tracwiki(md) == (
+        " 10. j\n\n     = h =\n     after\n 11. k"
+    )
 
 
 def test_the_documented_example_literally():
@@ -434,249 +394,7 @@ def test_write_leg_bullets_and_items_1_to_9_keep_masters_bytes(
     assert out == WRITE_PINS[(kind, depth, shape)]
 
 
-# -- read leg -------------------------------------------------------------
-
-
-@pytest.mark.parametrize(("number", "depth"), ORDERED, ids=IDS)
-class TestReadLegMovesTheLineToTheTextColumn:
-    def _text(self, number, depth):
-        ind, bound, text, marker = _cols(number, depth)
-        return ind, bound, " " * text, marker
-
-    @pytest.mark.parametrize(
-        "offset", [1, 2, 3], ids=["m+1", "m+2", "m+3"]
-    )
-    def test_lazy_line_at_every_column_inside_the_bound(
-        self, number, depth, offset
-    ):
-        ind, _, text, marker = self._text(number, depth)
-        column = len(ind) + offset
-        md = _tail(
-            _read(_tw_list(number, depth, column, ["lazy"])), marker
-        )
-        assert (
-            md == f"{ind}{marker} j\n{text}lazy\n{ind}{number + 1}. k\n"
-        )
-
-    def test_line_at_the_marker_column_goes_there_too(
-        self, number, depth
-    ):
-        # #149's rule, unchanged: the column is the marker's own.
-        ind, _, text, marker = self._text(number, depth)
-        md = _tail(
-            _read(_tw_list(number, depth, len(ind), ["lazy"])), marker
-        )
-        assert (
-            md == f"{ind}{marker} j\n{text}lazy\n{ind}{number + 1}. k\n"
-        )
-
-    def test_second_paragraph_after_br_br(self, number, depth):
-        # The motivating case. `[[BR]][[BR]]` becomes a whitespace-only
-        # line (item content, not a blank line to Trac); the next line must
-        # land at the text column to stay in the item.
-        ind, bound, text, marker = self._text(number, depth)
-        tw = _tw_list(
-            number,
-            depth,
-            bound,
-            ["lazy cont [[BR]][[BR]]", "second para"],
-        )
-        md = _tail(_read(tw), marker)
-        assert md == (
-            f"{ind}{marker} j\n{text}lazy cont   \n  \n"
-            f"{text}second para\n{ind}{number + 1}. k\n"
-        )
-
-    def test_soft_break_lines(self, number, depth):
-        ind, bound, text, marker = self._text(number, depth)
-        tw = _tw_list(number, depth, bound, ["soft1", "soft2"])
-        md = _tail(_read(tw), marker)
-        assert md == (
-            f"{ind}{marker} j\n{text}soft1\n{text}soft2\n"
-            f"{ind}{number + 1}. k\n"
-        )
-
-    def test_line_after_a_nested_list_that_closes_it(
-        self, number, depth
-    ):
-        # The write leg's "between" form. The nested list sits left of the
-        # outer item's text column, so since #179 its marker moves to that
-        # column, and #176's rule then keeps the first between line in the
-        # outer item (a blank line, then the text column); a LATER line
-        # continues the outer item, which is innermost by then, and is
-        # moved too.
-        ind, bound, text, marker = self._text(number, depth)
-        nested = " " * (2 * depth + 3)
-        first = " " * (2 * depth + 2)
-        head = _tw_list(number, depth, 0, []).split("\n")[:-2]
-        tail = [
-            f"{nested}* nested",
-            f"{first}between1 [[BR]][[BR]]",
-            f"{' ' * bound}between2",
-            f"{ind}{number + 1}. k",
-        ]
-        md = _tail(_read("\n".join(head + tail) + "\n"), marker)
-        assert md == (
-            f"{ind}{marker} j\n{text}- nested\n\n{text}between1   \n  \n"
-            f"{text}between2\n{ind}{number + 1}. k\n"
-        )
-
-    def test_line_past_the_bound_keeps_masters_bytes(
-        self, number, depth
-    ):
-        # m + 4 ends the list in Trac: fenced as unconverted, as on master.
-        ind, bound, _, marker = self._text(number, depth)
-        md = _tail(
-            _read(_tw_list(number, depth, bound + 1, ["past"])), marker
-        )
-        assert md == (
-            f"{ind}{marker} j\n\n```tracwiki-unconverted\n"
-            f"{' ' * (bound + 1)}past\n```\n\n{ind}{number + 1}. k\n"
-        )
-
-    def test_line_after_a_real_blank_line_keeps_masters_bytes(
-        self, number, depth
-    ):
-        ind, bound, _, marker = self._text(number, depth)
-        md = _tail(
-            _read(_tw_list(number, depth, bound, ["", "after"])), marker
-        )
-        assert md == (
-            f"{ind}{marker} j\n\n{' ' * bound}after\n{ind}{number + 1}. k\n"
-        )
-
-    def test_line_after_br_br_then_a_real_blank_line_is_not_moved(
-        self, number, depth
-    ):
-        ind, bound, _, marker = self._text(number, depth)
-        tw = _tw_list(
-            number, depth, bound, ["a [[BR]][[BR]]", "", "after"]
-        )
-        md = _tail(_read(tw), marker)
-        assert f"\n\n{' ' * bound}after\n" in md
-
-    def test_a_line_that_would_become_a_nested_item_is_not_moved(
-        self, number, depth
-    ):
-        ind, bound, _, marker = self._text(number, depth)
-        md = _tail(
-            _read(_tw_list(number, depth, bound, ["+ x"])), marker
-        )
-        assert f"\n{' ' * bound}+ x\n" in md
-
-
-def _tw_lines(number: int, depth: int, body: list[str]) -> str:
-    """TracWiki for item `j` and its `k`, `body` lines VERBATIM (their own
-    indentation, "" for an empty line), at depth 0 or 1 as `_tw_list`."""
-    lines: list[str] = []
-    ind = " " * (2 * depth + 1)
-    if depth:
-        lines.append(" * a")
-        lines += [f"   {i}. x" for i in range(1, number)]
-    lines.append(f"{ind}{number}. j")
-    lines += body
-    lines.append(f"{ind}{number + 1}. k")
-    return "\n".join(lines) + "\n"
-
-
-@pytest.mark.parametrize(("number", "depth"), ORDERED, ids=IDS)
-class TestOnlyAMacroMadeLineKeepsTheItemOpen:
-    """Review fix 2 (#178). Measured on /trac_test (2026-11-08): Trac ends the
-    list at a raw whitespace-only line exactly as at an empty one. Only the
-    line `[[BR]][[BR]]` becomes (a hard break, item content to Trac) leaves
-    the item open for the #178 rule."""
-
-    def _setup(self, number, depth):
-        ind, bound, text, marker = _cols(number, depth)
-        return ind, " " * bound, " " * text, marker
-
-    def test_raw_whitespace_only_line_ends_the_list(
-        self, number, depth
-    ):
-        ind, bound, text, marker = self._setup(number, depth)
-        tw = _tw_lines(number, depth, [f"{bound}a", "   ", f"{bound}b"])
-        md = _tail(_read(tw), marker)
-        # `a` continues the item and is moved; `b` is after a blank: master's
-        # bytes, still at the bound.
-        assert md == (
-            f"{ind}{marker} j\n{text}a\n   \n{bound}b\n"
-            f"{ind}{number + 1}. k\n"
-        )
-
-    def test_raw_tab_only_line_ends_the_list(self, number, depth):
-        ind, bound, text, marker = self._setup(number, depth)
-        tw = _tw_lines(number, depth, [f"{bound}a", "\t", f"{bound}b"])
-        md = _tail(_read(tw), marker)
-        assert md == (
-            f"{ind}{marker} j\n{text}a\n\t\n{bound}b\n"
-            f"{ind}{number + 1}. k\n"
-        )
-
-    @pytest.mark.parametrize(
-        "blank", ["", "   "], ids=["empty", "spaces"]
-    )
-    def test_crlf_document_blank_line_ends_the_list(
-        self, number, depth, blank
-    ):
-        ind, bound, text, marker = self._setup(number, depth)
-        tw = _tw_lines(
-            number, depth, [f"{bound}a", blank, f"{bound}b"]
-        ).replace("\n", "\r\n")
-        md = _tail(_read(tw), marker)
-        assert md == (
-            f"{ind}{marker} j\r\n{text}a\r\n{blank}\r\n{bound}b\r\n"
-            f"{ind}{number + 1}. k\r\n"
-        )
-
-    def test_br_br_line_still_keeps_the_item_open(self, number, depth):
-        ind, bound, text, marker = self._setup(number, depth)
-        tw = _tw_lines(
-            number, depth, [f"{bound}a [[BR]][[BR]]", f"{bound}b"]
-        )
-        md = _tail(_read(tw), marker)
-        assert md == (
-            f"{ind}{marker} j\n{text}a   \n  \n{text}b\n"
-            f"{ind}{number + 1}. k\n"
-        )
-
-    def test_a_lone_br_line_still_keeps_the_item_open(
-        self, number, depth
-    ):
-        ind, bound, text, marker = self._setup(number, depth)
-        tw = _tw_lines(
-            number, depth, [f"{bound}a", f"{bound}[[BR]]", f"{bound}b"]
-        )
-        md = _tail(_read(tw), marker)
-        assert md == (
-            f"{ind}{marker} j\n{text}a\n{bound}  \n{text}b\n"
-            f"{ind}{number + 1}. k\n"
-        )
-
-    def test_a_raw_whitespace_line_after_br_br_ends_the_list(
-        self, number, depth
-    ):
-        ind, bound, text, marker = self._setup(number, depth)
-        tw = _tw_lines(
-            number,
-            depth,
-            [f"{bound}a [[BR]][[BR]]", "   ", f"{bound}b"],
-        )
-        md = _tail(_read(tw), marker)
-        assert md == (
-            f"{ind}{marker} j\n{text}a   \n  \n   \n{bound}b\n"
-            f"{ind}{number + 1}. k\n"
-        )
-
-
-def test_a_raw_unit_separator_in_the_input_is_kept_and_never_a_marker():
-    """The marking uses a control character that counts as whitespace. A
-    document that already holds one disables the marking (the `[[BR]][[BR]]`
-    rule then keeps master's bytes) and its own characters are kept as
-    written."""
-    tw = " 10. j\n    a\n  \x1f\n    b\n 11. k\n"
-    assert _read(tw) == (" 10. j\n     a\n  \x1f\n    b\n 11. k\n")
-    tw = " 10. j\n    a [[BR]][[BR]]\n    b\x1f\n 11. k\n"
-    assert _read(tw) == (" 10. j\n     a   \n  \n    b\x1f\n 11. k\n")
+# -- the bound helper -----------------------------------------------------
 
 
 def test_trac_continuation_bound_helper():
@@ -690,97 +408,40 @@ def test_trac_continuation_bound_helper():
     assert trac_continuation_bound(3, ordered=False) == 5
 
 
-def test_read_leg_wide_gap_item_moves_to_the_text_column():
-    """` 1.   j` has its text at column 6, past the bound (4)."""
-    tw = " 1.   j\n    lazy [[BR]][[BR]]\n    second\n 2.   k\n"
-    assert _read(tw) == (
-        " 1.   j\n      lazy   \n  \n      second\n 2.   k\n"
-    )
-
-
-# What `master` read for shapes whose text column is within Trac's bound, and
-# for the WIDER shape the operator chose not to fix. Pinned literally.
-READ_PINS = [
-    pytest.param(
-        " * j\n   lazy [[BR]][[BR]]\n   second\n * k\n",
-        " - j\n   lazy   \n  \n   second\n - k\n",
-        id="bullet-m+2",
-    ),
-    pytest.param(
-        " * j\n  lazy\n * k\n",
-        " - j\n  lazy\n - k\n",
-        id="bullet-m+1-tight",
-    ),
-    pytest.param(
-        " 9. j\n    lazy [[BR]][[BR]]\n    second\n 10. k\n",
-        " 9. j\n    lazy   \n  \n    second\n 10. k\n",
-        id="item9-m+3",
-    ),
-    pytest.param(
-        " 9. j\n   lazy\n 10. k\n",
-        " 9. j\n   lazy\n 10. k\n",
-        id="item9-m+2-tight",
-    ),
-    pytest.param(
-        "   * a\n     * j\n       lazy [[BR]][[BR]]\n       second\n   * k\n",
-        "   - a\n     - j\n       lazy   \n  \n       second\n   - k\n",
-        id="bullet-d1",
-    ),
-    pytest.param(
-        " * j\n  lazy [[BR]][[BR]]\n  second\n * k\n",
-        " - j\n  lazy   \n  \n  second\n - k\n",
-        id="WIDER-bullet-m+1-after-br-br",
-    ),
-    pytest.param(
-        " 9. j\n   lazy [[BR]][[BR]]\n   second\n 10. k\n",
-        " 9. j\n   lazy   \n  \n   second\n 10. k\n",
-        id="WIDER-item9-m+2-after-br-br",
-    ),
-    pytest.param(
-        " 9. j\n  lazy [[BR]][[BR]]\n  second\n 10. k\n",
-        " 9. j\n  lazy   \n  \n  second\n 10. k\n",
-        id="WIDER-item9-m+1-after-br-br",
-    ),
-]
-
-
-@pytest.mark.parametrize(("tracwiki", "markdown"), READ_PINS)
-def test_read_leg_other_shapes_keep_masters_bytes(tracwiki, markdown):
-    assert _read(tracwiki) == markdown
-
-
-# -- round trip -----------------------------------------------------------
-
-SHAPES = {
-    "lazy": ["lazy"],
-    "soft": ["soft1", "soft2"],
-    "loose": ["", "second para"],
-    "loose3": ["", "second para", "", "third para"],
-    # Review fix 1: a run after an EMPTY line keeps master's text column.
-    "heading": ["", "# h", "", "after"],
-    "heading_only": ["", "# h"],
-    "hr_only": ["", "---"],
-}
-
-
-@pytest.mark.parametrize(("number", "depth"), ORDERED, ids=IDS)
-@pytest.mark.parametrize("shape", sorted(SHAPES))
-def test_markdown_to_tracwiki_to_markdown_to_tracwiki_is_stable(
-    number, depth, shape
-):
-    """MD -> TW -> MD -> TW gives the same TracWiki the second time, and the
-    continuation is in item `j` (a Markdown reading of the second leg keeps
-    it in the item, so the second write puts it at marker + 3 again)."""
-    md = _md_list("ordered", number, depth, SHAPES[shape])
-    first = markdown_to_tracwiki(md)
-    second = markdown_to_tracwiki(_read(first))
-    assert second == first
-    # And the text did not leave the item: no fence, no column-0 line.
-    assert "tracwiki-unconverted" not in _read(first)
-    assert "{{{" not in first
-
-
 # -- live -----------------------------------------------------------------
+
+
+class _ListTree(HTMLParser):
+    """The nesting of ul/ol/li/blockquote/pre in a render, with the text each
+    holds outside any nested one: `[tag, [text, ...], [children]]`."""
+
+    _TAGS = ("ul", "ol", "li", "blockquote", "pre")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.root: list = ["root", [], []]
+        self._open: list[list] = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._TAGS:
+            node: list = [tag, [], []]
+            self._open[-1][2].append(node)
+            self._open.append(node)
+
+    def handle_endtag(self, tag):
+        if tag in self._TAGS and len(self._open) > 1:
+            self._open.pop()
+
+    def handle_data(self, data):
+        text = " ".join(data.split())
+        if text:
+            self._open[-1][1].append(text)
+
+
+def _structure(html: str) -> list:
+    parser = _ListTree()
+    parser.feed(html)
+    return parser.root
 
 
 @pytest.mark.live
@@ -790,13 +451,13 @@ def test_live_loose_ten_item_list_renders_as_one_list_with_item_10_whole():
     paragraph renders as ONE `<ol>`, the paragraph inside item 10. Read-only
     (`wiki_to_html`, the render path `convert_preview` uses, writes
     nothing)."""
+    from tests.live_helpers import TEST_INSTANCE, trac_test_registry
     from trac_mcp_server.config_bootstrap import bootstrap_config
     from trac_mcp_server.core.client import TracClient
-    from trac_mcp_server.instances import InstanceRegistry
 
     config, _ = bootstrap_config()
     client = TracClient(
-        InstanceRegistry(config, {}).resolve("/trac_test")
+        trac_test_registry(config).resolve(TEST_INSTANCE)
     )
 
     md = "".join(f"{i}. x\n" for i in range(1, 10)) + (

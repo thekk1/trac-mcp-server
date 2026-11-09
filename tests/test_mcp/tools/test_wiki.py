@@ -945,6 +945,95 @@ class TestHandleCreate(unittest.TestCase):
             self.assertIn("already exists", text)
             self.assertIn("wiki_update", text)
 
+    def test_handle_create_real_not_found_shape_still_means_absent(
+        self,
+    ):
+        """TracXMLRPC's missing-page fault, Fault(404, 'Wiki page "X"
+        does not exist'), is classified by its code: create goes on to
+        put the page (Trac #189)."""
+        with patch(
+            "trac_mcp_server.mcp.tools.wiki_write.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = [
+                xmlrpc.client.Fault(
+                    404, 'Wiki page "NewPage" does not exist'
+                ),
+                {"name": "NewPage", "version": 1, "author": "alice"},
+            ]
+
+            result = asyncio.run(
+                _handle_create(
+                    self.mock_client,
+                    {"page_name": "NewPage", "content": "# New Page"},
+                )
+            )
+
+            self.assertFalse(result.isError)
+            self.assertIn(
+                "Created wiki page 'NewPage'", result.content[0].text
+            )
+
+    def test_handle_create_code_1_invalid_name_is_not_absent(self):
+        """A code-1 fault is any TracError, and its quoted name
+        'Not Found Notes' is no evidence of a missing page: the
+        existence check re-raises it instead of creating (Trac #189)."""
+        fault = xmlrpc.client.Fault(
+            1,
+            "'Invalid Wiki page name 'Not Found Notes'' while "
+            "executing 'wiki.getPage()'",
+        )
+        with patch(
+            "trac_mcp_server.mcp.tools.wiki_write.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = [fault, {"version": 1}]
+
+            with self.assertRaises(xmlrpc.client.Fault) as ctx:
+                asyncio.run(
+                    _handle_create(
+                        self.mock_client,
+                        {
+                            "page_name": "Not Found Notes",
+                            "content": "# New Page",
+                        },
+                    )
+                )
+
+            self.assertIs(ctx.exception, fault)
+            # Only the existence check ran; nothing was created.
+            self.assertEqual(mock_run_sync.call_count, 1)
+
+    def test_wiki_create_code_1_invalid_name_is_a_server_error(self):
+        """End to end through the dispatcher: the code-1 fault is
+        neither a created page nor an absent one (Trac #189)."""
+        with patch(
+            "trac_mcp_server.mcp.tools.wiki_write.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = [
+                xmlrpc.client.Fault(
+                    1,
+                    "'Invalid Wiki page name 'Not Found Notes'' "
+                    "while executing 'wiki.getPage()'",
+                ),
+                {"version": 1},
+            ]
+
+            result = asyncio.run(
+                ToolRegistry(WIKI_WRITE_SPECS).call_tool(
+                    "wiki_create",
+                    {
+                        "page_name": "Not Found Notes",
+                        "content": "# New Page",
+                    },
+                    self.mock_client,
+                )
+            )
+
+            self.assertTrue(result.isError)
+            text = result.content[0].text
+            self.assertIn("Error (server_error)", text)
+            self.assertNotIn("Created wiki page", text)
+            self.assertEqual(mock_run_sync.call_count, 1)
+
 
 class TestHandleUpdate(unittest.TestCase):
     """Test _handle_update handler."""
@@ -1674,6 +1763,82 @@ class TestHandleDelete(unittest.TestCase):
             self.assertIn("Error (permission_denied)", text)
             self.assertIn("permission", text.lower())
 
+    def test_handle_delete_real_not_found_shape_is_not_found(self):
+        """Fault(404, 'Wiki page "X" does not exist') from the
+        existence check is the not_found response (Trac #189)."""
+        with patch(
+            "trac_mcp_server.mcp.tools.wiki_write.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = xmlrpc.client.Fault(
+                404, 'Wiki page "NoSuchPage" does not exist'
+            )
+
+            result = asyncio.run(
+                _handle_delete(
+                    self.mock_client, {"page_name": "NoSuchPage"}
+                )
+            )
+
+            self.assertTrue(result.isError)
+            text = result.content[0].text
+            self.assertIn("Error (not_found)", text)
+            self.assertIn("Wiki page 'NoSuchPage' does not exist", text)
+            self.assertEqual(mock_run_sync.call_count, 1)
+
+    def test_handle_delete_code_1_invalid_name_is_not_not_found(self):
+        """A code-1 fault whose quoted name contains 'Not Found' is no
+        missing page: the existence check re-raises it and nothing is
+        deleted (Trac #189)."""
+        fault = xmlrpc.client.Fault(
+            1,
+            "'Invalid Wiki page name 'Not Found Notes'' while "
+            "executing 'wiki.getPage()'",
+        )
+        with patch(
+            "trac_mcp_server.mcp.tools.wiki_write.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = [fault, True]
+
+            with self.assertRaises(xmlrpc.client.Fault) as ctx:
+                asyncio.run(
+                    _handle_delete(
+                        self.mock_client,
+                        {"page_name": "Not Found Notes"},
+                    )
+                )
+
+            self.assertIs(ctx.exception, fault)
+            self.assertEqual(mock_run_sync.call_count, 1)
+
+    def test_wiki_delete_code_1_invalid_name_is_a_server_error(self):
+        """End to end through the dispatcher: neither deleted nor
+        not_found (Trac #189)."""
+        with patch(
+            "trac_mcp_server.mcp.tools.wiki_write.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = [
+                xmlrpc.client.Fault(
+                    1,
+                    "'Invalid Wiki page name 'Not Found Notes'' "
+                    "while executing 'wiki.getPage()'",
+                ),
+                True,
+            ]
+
+            result = asyncio.run(
+                ToolRegistry(WIKI_WRITE_SPECS).call_tool(
+                    "wiki_delete",
+                    {"page_name": "Not Found Notes"},
+                    self.mock_client,
+                )
+            )
+
+            self.assertTrue(result.isError)
+            text = result.content[0].text
+            self.assertIn("Error (server_error)", text)
+            self.assertNotIn("Deleted wiki page", text)
+            self.assertEqual(mock_run_sync.call_count, 1)
+
 
 class TestHandleWikiTool(unittest.TestCase):
     """Test wiki tool dispatch via ToolRegistry."""
@@ -1710,8 +1875,8 @@ class TestWikiUpdateStaleVersionLive:
         import os
         import uuid
 
+        from tests.live_helpers import TEST_INSTANCE, trac_test_registry
         from trac_mcp_server.core.client import TracClient
-        from trac_mcp_server.instances import InstanceRegistry
 
         default_config = Config(
             trac_url=os.environ["TRAC_URL"],
@@ -1721,7 +1886,7 @@ class TestWikiUpdateStaleVersionLive:
             in ("1", "true", "yes"),
         )
         client = TracClient(
-            InstanceRegistry(default_config, {}).resolve("/trac_test")
+            trac_test_registry(default_config).resolve(TEST_INSTANCE)
         )
 
         page = f"Scratch/Ticket120StaleVersion{uuid.uuid4().hex[:8]}"
@@ -1779,8 +1944,8 @@ class TestWikiSearchLive:
         import random
         import string
 
+        from tests.live_helpers import TEST_INSTANCE, trac_test_registry
         from trac_mcp_server.core.client import TracClient
-        from trac_mcp_server.instances import InstanceRegistry
 
         default_config = Config(
             trac_url=os.environ["TRAC_URL"],
@@ -1790,7 +1955,7 @@ class TestWikiSearchLive:
             in ("1", "true", "yes"),
         )
         client = TracClient(
-            InstanceRegistry(default_config, {}).resolve("/trac_test")
+            trac_test_registry(default_config).resolve(TEST_INSTANCE)
         )
 
         # One-token nonsense words, unique to this run. Letters only: the

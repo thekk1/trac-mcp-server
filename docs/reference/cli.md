@@ -62,7 +62,7 @@ The `trac-mcp-server` command is registered as an entry point in `pyproject.toml
 
 ## trac-convert
 
-The `trac-convert` command is a standalone binary that converts between TracWiki and Markdown formats. It is designed for interactive shell use and Unix pipe composition. Most operations work without a Trac connection; `--from-wiki`, `--to-wiki`, and `--check-trac` connect to a live Trac instance using the same credentials and config precedence as `trac-mcp-server`.
+The `trac-convert` command is a standalone binary that converts between TracWiki and Markdown formats. It is designed for interactive shell use and Unix pipe composition. Markdown -> TracWiki works without a Trac connection. TracWiki -> Markdown does not: Trac renders the text and `trac-convert` translates the HTML it returns (Trac /trac_mcp_server #210), so it connects to a live Trac instance, as do `--from-wiki`, `--to-wiki`, and `--check-trac`, using the same credentials and config precedence as `trac-mcp-server`. With no Trac configured, TracWiki -> Markdown exits `4` and writes nothing to stdout.
 
 ### Usage
 
@@ -89,10 +89,11 @@ trac-convert --version
 | `--from-clipboard` | -- | Read input from system clipboard instead of stdin/file. On Linux, requires one of `wl-clipboard`, `xclip`, or `xsel` to be installed (tried in that order, based on `$WAYLAND_DISPLAY` / `$DISPLAY`); falls back to `pyperclip`. On headless terminals without a clipboard tool, use `--from-file PATH` or pipe input on stdin instead. |
 | `--to-clipboard` | -- | Write output to system clipboard instead of stdout/file. Same Linux tool requirement as `--from-clipboard`. |
 | `--heading-anchors {on,off}` | `on` | md→tracwiki only: emit explicit `#slug` anchors on TracWiki headings (silently ignored in tw→md direction) |
-| `--unknown-macros {bracket,preserve,drop}` | `bracket` | tw→md only: how to render unknown TracWiki macros — `bracket` = `[MACRO: Name]`, `preserve` = leave `[[Name]]` literal, `drop` = omit (silently ignored in md→tw direction) |
+| `--link-map FROM=TO` | -- | TracWiki -> Markdown only (`--from-wiki` and file / stdin / clipboard input): rewrite link targets that start with `FROM` to start with `TO`, longest `FROM` first, split at the first `=`. Repeatable. **Replaces** the configured map (`export.link_rewrites`, `TRAC_MCP_LINK_REWRITES`; see [Configuration](configuration.md#link-rewrites-export)) rather than adding to it. Image sources and in-page `#anchors` are never rewritten, and the link text is kept. In any other direction it prints one `warning: --link-map has no effect ...` line (suppressed by `-q`). A value with no `=`, an empty `FROM`, or a repeated `FROM` is a usage error (exit `2`). |
 | `-v, --verbose` | -- | Emit `info:` diagnostics to stderr (mutually exclusive with `-q`) |
 | `-q, --quiet` | -- | Suppress `warning:` lines to stderr (mutually exclusive with `-v`; does NOT suppress `error:` lines) |
-| `--from-wiki PAGE` | -- | Fetch input from a Trac wiki page (source format is TracWiki). Mutually exclusive with `FILE` positional and `--from-clipboard`. |
+| `--from-wiki PAGE` | -- | Fetch input from a Trac wiki page (source format is TracWiki); to Markdown it translates the page's own rendered HTML, so relative links resolve as Trac resolves them. The page version is read first and the source and the HTML are both read at it, so a save in between cannot pair one version's source with another's HTML; if the version cannot be read, both reads are the latest and a `warning:` line says they were not pinned. Mutually exclusive with `FILE` positional and `--from-clipboard`. |
+| `--force` | -- | Convert Markdown exported from Trac (front matter carrying `trac_page`) to TracWiki anyway, stripping that front matter. Without it, that conversion (`--to tracwiki` or `--to-wiki`) exits `1` with `trac-convert: refusing to convert: this Markdown was exported from Trac page 'P' (instance I, version V) and the export is one-way; edit the page as TracWiki (trac-convert --from-wiki P --to tracwiki), or pass --force` and writes nothing, to Trac or to the output. `--from-wiki PAGE --to md` starts its output (stdout, `-o` or the clipboard) with that front matter; text, file and clipboard input never gets any. See [Format Conversion](format-conversion.md#front-matter-on-an-export) |
 | `--to-wiki PAGE` | -- | Write output to a Trac wiki page (target format is TracWiki). Mutually exclusive with `-o/--output` and `--to-clipboard`. Bypasses the `--to` requirement. |
 | `--wiki-comment MSG` | `Updated via trac-convert` | Change comment recorded on the wiki page when using `--to-wiki`. Ignored without `--to-wiki`. |
 | `--check-trac` | -- | Print resolved Trac config source per field, ping the server, and exit (no conversion performed). |
@@ -110,12 +111,12 @@ trac-convert --version
 | `1` | Runtime error (I/O failure, clipboard unavailable, mutually-exclusive flag conflict) |
 | `2` | Usage error (argparse-emitted: missing required flag, bad choice) |
 | `3` | Conversion error (exception raised inside the converter) |
-| `4` | Trac error (auth failure, network/timeout, permission denied, page not found, XML-RPC fault, SSL error) — emitted by `--check-trac`, `--from-wiki`, and `--to-wiki`. With `--to-wiki`, nothing was stored. |
+| `4` | Trac error (auth failure, network/timeout, permission denied, page not found, XML-RPC fault, SSL error) — emitted by `--check-trac`, `--from-wiki`, `--to-wiki`, and the rendering step of TracWiki -> Markdown. TracWiki -> Markdown with no Trac configured also exits `4`: the message says to set `TRAC_URL`, `TRAC_USERNAME`, `TRAC_PASSWORD` (or `.trac_mcp/config.yaml`) or pass `--trac-url`, and nothing is written to stdout. When the configuration exists but is invalid (a bad `TRAC_URL`), the message ends with a `  config error: <reason>` line, here and on `--from-wiki`'s "no Trac credentials found" message; when `--from auto` resolved the input to TracWiki, a last line says so and to pass `--from md` if it is Markdown. With `--to-wiki`, nothing was stored. |
 | `5` | `--to-wiki` stored the page, but reading back its new version failed. The message on stderr says the page WAS stored; do not retry the write. |
 
 ### Auto-detection
 
-When `--from auto` is used (the default when omitted), the format is detected via `converters.common.detect_format`: TracWiki markers (`{{{`, `[[`, `= Heading =`) win, otherwise Markdown is assumed. On ambiguous input, prefer the explicit `--from` flag.
+When `--from auto` is used (the default when omitted), the format is detected via `converters.common.detect_format`: TracWiki markers (`{{{`, `[[`, `= Heading =`) win, otherwise Markdown is assumed. On ambiguous input, prefer the explicit `--from` flag. Detection runs before Trac is contacted, so input that resolves to Markdown never needs a connection.
 
 ### Trac Wiki I/O
 
@@ -131,13 +132,14 @@ trac-convert --from-wiki MyPage --to md -o my-page.md
 # Push a Markdown file back to Trac
 trac-convert --from-file notes.md --to-wiki MyPage --wiki-comment "Edited via CLI"
 
-# Round-trip: fetch, edit locally, then push back
-trac-convert --from-wiki MyPage --to md -o my-page.md
-# (edit my-page.md)
-trac-convert --from-file my-page.md --to-wiki MyPage
+# Edit a page as TracWiki, not Markdown (the Markdown export is one-way):
+# fetch the source, edit it locally, then push it back
+trac-convert --from-wiki MyPage --to tracwiki -o my-page.tw
+# (edit my-page.tw)
+trac-convert --from tracwiki --from-file my-page.tw --to-wiki MyPage
 ```
 
-On failure, `trac-convert` exits with code `4` and writes a classified error message (page-not-found, permission-denied, timeout, SSL, connection, generic) to stderr. See [Configuration](configuration.md) for the full auth and config precedence rules.
+On failure, `trac-convert` exits with code `4` and writes a classified error message (page-not-found, permission-denied, timeout, SSL, connection, generic) to stderr; a failed render of TracWiki -> Markdown is reported the same way, with the action `wiki render`. See [Configuration](configuration.md) for the full auth and config precedence rules.
 
 ### Installation
 
@@ -162,8 +164,8 @@ Unlike `trac-convert --to-wiki`, which talks XML-RPC to Trac directly with local
 ### Usage
 
 ```bash
-trac-mcp wiki-push PAGE FILE [--format auto|markdown|tracwiki] [--comment TEXT] [--keep-frontmatter]
-trac-mcp wiki-pull PAGE FILE [--format markdown|tracwiki] [--page-version N]
+trac-mcp wiki-push PAGE FILE [--format auto|markdown|tracwiki] [--comment TEXT] [--keep-frontmatter] [--force]
+trac-mcp wiki-pull PAGE FILE [--format markdown|html|tracwiki] [--page-version N] [--link-map FROM=TO ...]
 trac-mcp attach-put (--ticket N | --page PAGE) FILE [--filename NAME] [--description TEXT] [--replace]
 trac-mcp attach-get (--ticket N | --page PAGE) NAME FILE
 trac-mcp detect-format FILE        # runs locally, no server call
@@ -183,6 +185,12 @@ The four `ticket-*` commands move ticket bodies. The file is read as UTF-8 and s
 `wiki-push` exits **4**, not 1, when the page was stored but its new version could not be read back afterwards (the server reports `readback_failed`): do not retry the push. Exit 1 means nothing was stored.
 
 When the server reports `possible_overwrite` (the page was updated but reads back as a version other than the one after the version the push was based on, so another write most likely landed just before it and was replaced), `wiki-push` prints a `trac-mcp: warning: possible overwrite ...` line on stderr naming the versions in between, and still exits **0**: the page was stored, and a non-zero code would invite a retry that writes it again. Inspect those versions with the `wiki_diff` tool.
+
+`wiki-pull` writes what the tool returns, so a Markdown pull starts with YAML front matter (`title`, `source`, `trac_instance`, `trac_page`, `trac_version`, `exported`; see [Format Conversion](format-conversion.md#front-matter-on-an-export)). `wiki-push` of that text is refused by the server (a `validation_error`, exit 1, nothing stored) unless you pass `--force`, which is sent as `force: true` (only when given). Against a daemon that predates the guard `--force` fails with `the server does not know --force: it predates the exported-Markdown guard ...` (exit 1): such a daemon does not refuse the push either, so deploy it or push without `--force`. Deleting the front matter by hand defeats the guard; that is accepted.
+
+`wiki-pull` prints each warning the server returns for the pull (what the Markdown translation passed through as HTML or dropped, or that the page version could not be read so the reads were not pinned to one version) as a `trac-mcp: warning: ...` line on stderr after writing the file, and still exits **0**.
+
+`wiki-pull --link-map FROM=TO` (repeatable, split at the first `=`) is sent as the `link_rewrites` argument of `wiki_file_pull` and **replaces** the map for that pull. Without it, `wiki-pull` reads `export.link_rewrites` -- that key only, nothing else of the config, and not the `TRAC_MCP_LINK_REWRITES` variable -- from the config file it finds on **this machine** (`.trac_mcp/config.yml` / `.yaml` in the working directory, or the global ones; see [Configuration](configuration.md#configuration-file)) and sends that. If no config file has the key, it sends nothing and the **daemon's** configured map applies. The rewrite map is a publishing choice, so it is kept with the person exporting rather than in the daemon's config. A local config file that cannot be read, or whose `export` section is invalid, is a usage error (exit `2`, one `trac-mcp: wiki-pull: ...` line naming the problem) and nothing is pulled; `--link-map` bypasses the file, and `--format html` and `--format tracwiki` never read it (and `--link-map` with either prints a `no effect` warning and sends nothing). `--format html` writes Trac's own render as a complete minimal HTML document (no conversion, links absolute, no CSS). Links only: image sources and in-page `#anchors` are never rewritten. See [Link rewrites](configuration.md#link-rewrites-export).
 
 The server's write-time link gate and notes apply to all three writes, as for the equivalent MCP tools.
 

@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import base64
 import json
+import logging
 import os
 import re
 import sys
@@ -41,6 +42,7 @@ from typing import Any
 from .. import __version__
 from ..core.client import MAX_COMMENT_CHARS, TracClient
 from ..file_handler import detect_file_format, read_file_with_encoding
+from ..link_rewrites import link_map_arg
 
 EXIT_OK = 0
 EXIT_TOOL_ERROR = 1  # the server answered with an error result
@@ -561,6 +563,87 @@ async def _ticket_pull(
     return EXIT_OK
 
 
+def _link_rewrites_to_send(
+    args: argparse.Namespace,
+) -> list[dict[str, str]] | None:
+    """The ``link_rewrites`` argument of a ``wiki-pull``, or None to send
+    none (Trac /trac_mcp_server #213).
+
+    ``--link-map`` on the command line, else ``export.link_rewrites``
+    from this machine's ``.trac_mcp/config.yaml`` -- only that key, and
+    the environment is not read -- else nothing, and the server's own map
+    applies. A TracWiki or HTML pull rewrites no links (HTML is Trac's own
+    render, #211), so it sends none (the server would ignore it, and a
+    broken local config should not stop it).
+    """
+    from ..link_rewrites import as_entries, parse_pairs
+
+    if args.format != "markdown":
+        if args.link_map:
+            print(
+                "trac-mcp: warning: --link-map has no effect with "
+                f"--format {args.format}",
+                file=sys.stderr,
+            )
+        return None
+    if args.link_map is not None:
+        try:
+            return as_entries(parse_pairs(args.link_map, "--link-map"))
+        except ValueError as e:
+            raise CliError(str(e), EXIT_USAGE_ERROR) from None
+    from ..config_bootstrap import load_local_link_rewrites
+
+    # load_hierarchical_config logs a traceback for an unreadable file;
+    # the CliError below says it in one line.
+    loader_log = logging.getLogger("trac_mcp_server.config_loader")
+    previous = loader_log.level
+    loader_log.setLevel(logging.CRITICAL)
+    try:
+        local = load_local_link_rewrites()
+    except ValueError as e:
+        raise CliError(
+            f"wiki-pull: {e} (the export.link_rewrites key of "
+            ".trac_mcp/config.yaml; pass --link-map to override it)",
+            EXIT_USAGE_ERROR,
+        ) from None
+    finally:
+        loader_log.setLevel(previous)
+    return None if local is None else as_entries(local)
+
+
+def _refuses_link_rewrites(text: str) -> bool:
+    """Whether an error result is the input schema refusing the
+    ``link_rewrites`` argument, as a server that predates #213 does (its
+    strict schema allows no extra property). A current server's own
+    ``validation_error`` about a rule does not say "unexpected"."""
+    lowered = text.lower()
+    return "link_rewrites" in lowered and (
+        "additional properties" in lowered
+        or "unexpected" in lowered
+        or "unknown" in lowered
+    )
+
+
+def _refuses_format_html(text: str) -> bool:
+    """Whether an error result is the input schema refusing
+    ``format="html"`` as not one of its enum, as a server that predates
+    #211 does (its enum is markdown | tracwiki)."""
+    lowered = text.lower()
+    return "'html'" in lowered and "not one of" in lowered
+
+
+def _refuses_force(text: str) -> bool:
+    """Whether an error result is the input schema refusing the ``force``
+    argument, as a server that predates #212 does (its strict schema
+    allows no extra property: ``('force' was unexpected)``). The quoted
+    name is matched, not the bare word: an unrelated error that says
+    "enforced" is not this."""
+    lowered = text.lower()
+    return "'force'" in lowered and (
+        "additional properties" in lowered or "unexpected" in lowered
+    )
+
+
 async def _run(
     args: argparse.Namespace, url: str, token: str | None
 ) -> int:
@@ -595,12 +678,26 @@ async def _run(
             arguments["comment"] = args.comment
         if args.target_cap is not None:
             arguments["target_cap"] = args.target_cap
+        if args.force:
+            arguments["force"] = True
         result = await call_tool(
             url,
             token,
             "wiki_file_push",
             _with_instance(args, arguments),
         )
+        if (
+            result.isError
+            and args.force
+            and _refuses_force(_result_text(result))
+        ):
+            raise CliError(
+                "the server does not know --force: it predates the "
+                "exported-Markdown guard (Trac /trac_mcp_server #212) and "
+                "does not refuse such a push either. Deploy it, or push "
+                "without --force",
+                EXIT_TOOL_ERROR,
+            )
         rc = _report(result)
         if rc == EXIT_OK and _sc(result).get("readback_failed"):
             # Stored, but the new version could not be read back (Trac
@@ -651,6 +748,9 @@ async def _run(
         arguments = {"page_name": args.page, "format": args.format}
         if args.page_version is not None:
             arguments["version"] = args.page_version
+        link_rewrites = _link_rewrites_to_send(args)
+        if link_rewrites is not None:
+            arguments["link_rewrites"] = link_rewrites
         result = await call_tool(
             url,
             token,
@@ -658,8 +758,36 @@ async def _run(
             _with_instance(args, arguments),
         )
         if result.isError:
+            if args.format == "html" and _refuses_format_html(
+                _result_text(result)
+            ):
+                raise CliError(
+                    "the server does not know --format html: it predates "
+                    "it (Trac /trac_mcp_server #211). Deploy it, or use "
+                    "--format markdown|tracwiki",
+                    EXIT_TOOL_ERROR,
+                )
+            if link_rewrites is not None and _refuses_link_rewrites(
+                _result_text(result)
+            ):
+                raise CliError(
+                    "the server does not know link_rewrites: it predates "
+                    "link rewriting (Trac /trac_mcp_server #213). Deploy "
+                    "it, or remove export.link_rewrites from the local "
+                    "config / drop --link-map",
+                    EXIT_TOOL_ERROR,
+                )
             return _report(result)
         sc = result.structuredContent or {}
+        if (
+            link_rewrites is not None
+            and sc.get("link_rewrites_source") != "call"
+        ):
+            print(
+                "trac-mcp: warning: the server did not confirm the "
+                "link map was applied",
+                file=sys.stderr,
+            )
         data = _payload(result, "content").encode("utf-8")
         _write_bytes(args.file, data)
         _say(
@@ -668,6 +796,11 @@ async def _run(
             f"format={sc.get('format')}) to {args.file} ({len(data)} bytes)",
         )
         _say_instance(args.file == "-", result)
+        # The translator's notes on what the Markdown lost or passed
+        # through, and the version-pin warning (Trac /trac_mcp_server
+        # #210): stderr, so a script that captures stdout still sees them.
+        for warning in sc.get("warnings") or []:
+            print(f"trac-mcp: warning: {warning}", file=sys.stderr)
         return EXIT_OK
 
     if cmd == "attach-put":
@@ -810,6 +943,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Max cross-instance link targets the write gate probes",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Push even if the file is Markdown exported from Trac "
+            "(front matter carrying trac_page)"
+        ),
+    )
 
     p = sub.add_parser(
         "wiki-pull", help="Pull a wiki page to a local file"
@@ -818,14 +959,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("file", help="Local output file ('-' for stdout)")
     p.add_argument(
         "--format",
-        choices=["markdown", "tracwiki"],
+        choices=["markdown", "html", "tracwiki"],
         default="markdown",
-        help="Output format (default: markdown)",
+        help=(
+            "Output format (default: markdown; html is Trac's render "
+            "as a complete minimal HTML document)"
+        ),
     )
     p.add_argument(
         "--page-version",
         type=int,
         help="Specific page version to pull",
+    )
+    p.add_argument(
+        "--link-map",
+        action="append",
+        type=link_map_arg,
+        default=None,
+        metavar="FROM=TO",
+        help=(
+            "Rewrite the page's links: a link target starting with FROM "
+            "has that prefix replaced by TO (longest FROM first; "
+            "images and #anchors are never rewritten). Repeatable. "
+            "Replaces export.link_rewrites of .trac_mcp/config.yaml, "
+            "which is sent when this is not given. Markdown only (no "
+            "effect with html or tracwiki)."
+        ),
     )
 
     for name, helptext in (

@@ -1,11 +1,16 @@
 """Tests for wiki_file tool handlers: detect_format, push, pull, and frontmatter stripping."""
 
 import xmlrpc.client
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import mcp.types as types
 import pytest
 
+from trac_mcp_server.converters.front_matter import split_front_matter
+from trac_mcp_server.converters.html_to_markdown import (
+    trac_html_to_markdown,
+)
 from trac_mcp_server.core.client import (
     WikiPageConflict,
     WikiPageNotModified,
@@ -143,6 +148,7 @@ def _make_client():
     client.config.password = "pass"
     client.config.verify_ssl = True
     client.config.auto_convert = True
+    client.config.link_rewrites = ()
     return client
 
 
@@ -745,6 +751,43 @@ class TestPushReadbackAfterWrite:
         client.put_wiki_page.assert_called_once()
         assert client.put_wiki_page.call_args[0][3] is None
 
+    async def test_probe_real_404_means_absent_and_creates(self):
+        """TracXMLRPC's missing-page fault, Fault(404, 'Wiki page "X"
+        does not exist'), is classified by its code (Trac #191)."""
+        client = _make_client()
+        client.get_wiki_page_info.side_effect = xmlrpc.client.Fault(
+            404, 'Wiki page "X" does not exist'
+        )
+        client.put_wiki_page.return_value = {"version": 1}
+        result = await _registry.call_tool(
+            "wiki_file_push",
+            {"content": "= X =\n", "page_name": "X"},
+            client,
+        )
+        assert result.structuredContent["action"] == "created"
+        client.put_wiki_page.assert_called_once()
+
+    async def test_probe_code_1_quoted_name_is_not_absence(self):
+        """A code-1 fault is any TracError, and the name it quotes,
+        'Not Found Notes', is no evidence that the page is missing:
+        the probe's fault propagates (the dispatcher's server error)
+        and nothing is written (Trac #191)."""
+        client = _make_client()
+        client.get_wiki_page_info.side_effect = xmlrpc.client.Fault(
+            1,
+            "'Invalid Wiki page name 'Not Found Notes'' while "
+            "executing 'wiki.getPageInfo()'",
+        )
+        result = await _registry.call_tool(
+            "wiki_file_push",
+            {"content": "= X =\n", "page_name": "Not Found Notes"},
+            client,
+        )
+        assert result.isError is True
+        assert "server_error" in result.content[0].text
+        assert "not_found" not in result.content[0].text
+        client.put_wiki_page.assert_not_called()
+
     async def test_write_fault_is_not_retried_as_a_create(self):
         """A not-found fault raised by the write itself (not the probe)
         is an error, never a second write."""
@@ -1055,6 +1098,10 @@ class TestPull:
         client.get_wiki_page.return_value = (
             "= Hello =\n\n'''bold''' text."
         )
+        client.get_wiki_page_html.return_value = (
+            '<h1 id="Hello">Hello</h1>\n'
+            "<p>\n<strong>bold</strong> text.\n</p>\n"
+        )
         client.get_wiki_page_info.return_value = {
             "version": 5,
             "author": "admin",
@@ -1118,6 +1165,9 @@ class TestPull:
 
         client = _make_client()
         client.get_wiki_page.return_value = "= Hello ="
+        client.get_wiki_page_html.return_value = (
+            '<h1 id="Hello">Hello</h1>\n'
+        )
         client.get_wiki_page_info.return_value = {"version": 1}
 
         result = await _registry.call_tool(
@@ -1136,6 +1186,9 @@ class TestPull:
 
         client = _make_client()
         client.get_wiki_page.return_value = "= Old Version ="
+        client.get_wiki_page_html.return_value = (
+            '<h1 id="OldVersion">Old Version</h1>\n'
+        )
         client.get_wiki_page_info.return_value = {
             "version": 2,
             "author": "admin",
@@ -1156,7 +1209,83 @@ class TestPull:
 
         # Verify get_wiki_page was called with version=2
         client.get_wiki_page.assert_called_once_with("TestPage", 2)
+        client.get_wiki_page_html.assert_called_once_with("TestPage", 2)
         client.get_wiki_page_info.assert_called_once_with("TestPage", 2)
+
+    @pytest.mark.parametrize("info", [{}, 0, None, {"version": 0}])
+    async def test_pull_markdown_warns_when_version_cannot_be_read(
+        self, tmp_path, info
+    ):
+        """No usable version from get_wiki_page_info: the pull still
+        works, but the source and HTML reads were not pinned to one
+        version, and the caller is told in ``warnings``."""
+        out_file = tmp_path / "page.md"
+
+        client = _make_client()
+        client.get_wiki_page.return_value = "= Hello ="
+        client.get_wiki_page_html.return_value = (
+            '<h1 id="Hello">Hello</h1>\n'
+        )
+        client.get_wiki_page_info.return_value = info
+
+        result = await _registry.call_tool(
+            "wiki_file_pull",
+            {"page_name": "TestPage", "file_path": str(out_file)},
+            client,
+        )
+
+        assert not result.isError
+        assert "# Hello" in out_file.read_text()
+        warnings = result.structuredContent["warnings"]
+        assert len(warnings) == 1
+        assert "version could not be read" in warnings[0]
+        assert "not pinned" in warnings[0]
+        assert warnings[0] in result.content[0].text
+        client.get_wiki_page.assert_called_once_with("TestPage", None)
+        client.get_wiki_page_html.assert_called_once_with(
+            "TestPage", None
+        )
+
+    async def test_pull_markdown_with_a_version_has_no_pin_warning(
+        self, tmp_path
+    ):
+        client = _make_client()
+        client.get_wiki_page.return_value = "= Hello ="
+        client.get_wiki_page_html.return_value = (
+            '<h1 id="Hello">Hello</h1>\n'
+        )
+        client.get_wiki_page_info.return_value = {"version": 4}
+
+        result = await _registry.call_tool(
+            "wiki_file_pull",
+            {
+                "page_name": "TestPage",
+                "file_path": str(tmp_path / "page.md"),
+            },
+            client,
+        )
+
+        assert result.structuredContent["warnings"] == []
+
+    async def test_pull_tracwiki_with_no_version_has_no_pin_warning(
+        self, tmp_path
+    ):
+        """tracwiki reads no HTML, so there is nothing to pin."""
+        client = _make_client()
+        client.get_wiki_page.return_value = "= Hello ="
+        client.get_wiki_page_info.return_value = {}
+
+        result = await _registry.call_tool(
+            "wiki_file_pull",
+            {
+                "page_name": "TestPage",
+                "file_path": str(tmp_path / "page.wiki"),
+                "format": "tracwiki",
+            },
+            client,
+        )
+
+        assert result.structuredContent["warnings"] == []
 
     async def test_pull_nonexistent_page(self, tmp_path):
         """Pull a page that doesn't exist returns not_found error."""
@@ -1222,6 +1351,56 @@ class TestPull:
         assert result.isError is True
         assert "validation_error" in result.content[0].text
 
+    async def test_pull_real_404_is_not_found(self, tmp_path):
+        """TracXMLRPC's missing-page fault, Fault(404, 'Wiki page "X"
+        does not exist'), is classified by its code (Trac #191)."""
+        out_file = tmp_path / "page.md"
+
+        client = _make_client()
+        client.get_wiki_page.side_effect = xmlrpc.client.Fault(
+            404, 'Wiki page "NoSuchPage" does not exist'
+        )
+
+        result = await _registry.call_tool(
+            "wiki_file_pull",
+            {"page_name": "NoSuchPage", "file_path": str(out_file)},
+            client,
+        )
+
+        assert result.isError is True
+        assert "Error (not_found)" in result.content[0].text
+        assert not out_file.exists()
+
+    async def test_pull_code_1_quoted_name_is_not_not_found(
+        self, tmp_path
+    ):
+        """A code-1 fault is any TracError, and the name it quotes,
+        'Not Found Notes', is no evidence that the page is missing: the
+        fault propagates to the dispatcher, which reports a server
+        error, not a not_found (Trac #191)."""
+        out_file = tmp_path / "page.md"
+
+        client = _make_client()
+        client.get_wiki_page.side_effect = xmlrpc.client.Fault(
+            1,
+            "'Invalid Wiki page name 'Not Found Notes'' while "
+            "executing 'wiki.getPage()'",
+        )
+
+        result = await _registry.call_tool(
+            "wiki_file_pull",
+            {
+                "page_name": "Not Found Notes",
+                "file_path": str(out_file),
+            },
+            client,
+        )
+
+        assert result.isError is True
+        assert "server_error" in result.content[0].text
+        assert "not_found" not in result.content[0].text
+        assert not out_file.exists()
+
     async def test_pull_other_fault_reraises(self, tmp_path):
         """Non-not-found Fault is caught by the registry error handler."""
         out_file = tmp_path / "page.md"
@@ -1241,6 +1420,796 @@ class TestPull:
         assert isinstance(result, types.CallToolResult)
         assert result.isError is True
         assert "permission_denied" in result.content[0].text
+
+
+# =============================================================================
+# wiki_file_pull through the HTML -> Markdown translator (Trac #210)
+# =============================================================================
+
+_FIXTURES = Path(__file__).parents[2] / "fixtures" / "trac_html"
+# stock_TracCgi has two ``{{{#!python`` blocks and two translator
+# warnings (a dropped table of contents among them).
+_SLUG = "stock_TracCgi"
+
+
+def _fixture_pair():
+    return (
+        (_FIXTURES / f"{_SLUG}.html").read_text(encoding="utf-8"),
+        (_FIXTURES / f"{_SLUG}.tracwiki").read_text(encoding="utf-8"),
+    )
+
+
+def _fixture_client(version=7):
+    """A fake client serving the #208 fixture's source and HTML.
+
+    ``get_wiki_page_info`` reports ``version`` whatever was asked for,
+    as Trac reports the latest version when none is asked for.
+    """
+    html, source = _fixture_pair()
+    client = _make_client()
+    client.get_wiki_page.return_value = source
+    client.get_wiki_page_html.return_value = html
+    client.get_wiki_page_info.return_value = {
+        "version": version,
+        "author": "admin",
+    }
+    return client
+
+
+async def _pull(client, tmp_path, **extra):
+    """Pull TestPage to a file; return the result and the file's text."""
+    out = tmp_path / "out.md"
+    result = await _registry.call_tool(
+        "wiki_file_pull",
+        {"page_name": "TestPage", "file_path": str(out), **extra},
+        client,
+    )
+    return result, (out.read_text() if out.exists() else None)
+
+
+class TestPullThroughTranslator:
+    """format=markdown is Trac's rendered HTML, translated (Trac #210)."""
+
+    async def test_output_is_the_translator_output(self, tmp_path):
+        html, source = _fixture_pair()
+        expected = trac_html_to_markdown(html, source)
+
+        result, written = await _pull(_fixture_client(), tmp_path)
+
+        assert not result.isError
+        # Ticket #212: front matter, then the translator's output.
+        assert split_front_matter(written)[1] == expected.text
+        assert written.endswith("---\n\n" + expected.text)
+        assert result.structuredContent["converted"] is True
+
+    async def test_python_block_is_a_fenced_python_block(
+        self, tmp_path
+    ):
+        """The language comes from the source, which the handler must
+        pass to the translator: Trac's HTML does not name it."""
+        _, written = await _pull(_fixture_client(), tmp_path)
+
+        assert "```python\n" in written
+
+    async def test_html_read_is_pinned_to_the_info_version_latest(
+        self, tmp_path
+    ):
+        client = _fixture_client(version=7)
+
+        await _pull(client, tmp_path)
+
+        client.get_wiki_page_info.assert_called_once_with(
+            "TestPage", None
+        )
+        client.get_wiki_page.assert_called_once_with("TestPage", 7)
+        client.get_wiki_page_html.assert_called_once_with("TestPage", 7)
+
+    async def test_html_read_is_pinned_to_the_info_version_asked(
+        self, tmp_path
+    ):
+        client = _fixture_client(version=3)
+
+        await _pull(client, tmp_path, version=3)
+
+        client.get_wiki_page_info.assert_called_once_with("TestPage", 3)
+        client.get_wiki_page.assert_called_once_with("TestPage", 3)
+        client.get_wiki_page_html.assert_called_once_with("TestPage", 3)
+
+    async def test_info_is_read_before_the_source_and_the_html(
+        self, tmp_path
+    ):
+        client = _fixture_client()
+        order = []
+        for name in (
+            "get_wiki_page_info",
+            "get_wiki_page",
+            "get_wiki_page_html",
+        ):
+            mock = getattr(client, name)
+            mock.side_effect = (
+                lambda *a, _n=name, _r=mock.return_value, **k: (
+                    order.append(_n) or _r
+                )
+            )
+
+        await _pull(client, tmp_path)
+
+        assert order[0] == "get_wiki_page_info"
+        assert set(order) == {
+            "get_wiki_page_info",
+            "get_wiki_page",
+            "get_wiki_page_html",
+        }
+
+    async def test_warnings_reach_the_text_block_and_structured_content(
+        self, tmp_path
+    ):
+        html, source = _fixture_pair()
+        warnings = trac_html_to_markdown(html, source).warnings
+        assert warnings  # the fixture is chosen for having some
+
+        result, _ = await _pull(_fixture_client(), tmp_path)
+
+        assert result.structuredContent["warnings"] == warnings
+        text = result.content[0].text
+        assert "Conversion warnings:" in text
+        for warning in warnings:
+            assert warning in text
+
+    async def test_warnings_is_always_a_list(self, tmp_path):
+        client = _make_client()
+        client.get_wiki_page.return_value = "= Hello ="
+        client.get_wiki_page_html.return_value = (
+            '<h1 id="Hello">Hello</h1>\n'
+        )
+        client.get_wiki_page_info.return_value = {"version": 1}
+
+        result, _ = await _pull(client, tmp_path)
+        assert result.structuredContent["warnings"] == []
+        assert "Conversion warnings:" not in result.content[0].text
+
+        tracwiki, _ = await _pull(client, tmp_path, format="tracwiki")
+        assert tracwiki.structuredContent["warnings"] == []
+
+    async def test_tracwiki_never_reads_the_html(self, tmp_path):
+        client = _fixture_client()
+
+        result, written = await _pull(
+            client, tmp_path, format="tracwiki"
+        )
+
+        client.get_wiki_page_html.assert_not_called()
+        assert written == _fixture_pair()[1]
+        assert result.structuredContent["converted"] is False
+
+    @pytest.mark.parametrize(
+        "failing",
+        ["get_wiki_page_info", "get_wiki_page", "get_wiki_page_html"],
+    )
+    async def test_not_found_from_any_read_is_not_found(
+        self, failing, tmp_path
+    ):
+        client = _fixture_client()
+        getattr(client, failing).side_effect = xmlrpc.client.Fault(
+            404, 'Wiki page "TestPage" does not exist'
+        )
+
+        result, _ = await _pull(client, tmp_path)
+
+        assert result.isError is True
+        assert "Error (not_found)" in result.content[0].text
+        assert "TestPage" in result.content[0].text
+
+    async def test_other_fault_from_the_html_read_is_not_not_found(
+        self, tmp_path
+    ):
+        client = _fixture_client()
+        client.get_wiki_page_html.side_effect = xmlrpc.client.Fault(
+            403, "Permission denied"
+        )
+
+        result, _ = await _pull(client, tmp_path)
+
+        assert result.isError is True
+        assert "permission_denied" in result.content[0].text
+
+    def test_tool_description_says_what_markdown_is(self, tmp_path):
+        from trac_mcp_server.mcp.tools.wiki_file import WIKI_FILE_TOOLS
+
+        tool = next(
+            t for t in WIKI_FILE_TOOLS if t.name == "wiki_file_pull"
+        )
+        text = " ".join(tool.description.split())
+        assert "rendered HTML" in text
+        assert "one-way" in text
+        assert "not meant to be pushed back" in text
+
+
+# =============================================================================
+# wiki_file_pull link rewriting (Trac #213)
+# =============================================================================
+
+_PREFIX = "http://localhost/trac/wiki/"
+_RULE = {"from": _PREFIX, "to": "https://blog.example/"}
+_LINKS_HTML = (
+    f'<p><a href="{_PREFIX}Other">Other</a> '
+    '<a href="#Heading">Heading</a> '
+    '<img alt="i" src="http://localhost/trac/raw-attachment/wiki/P/i.png"/>'
+    "</p>\n"
+)
+
+
+def _links_client(configured=()):
+    client = _make_client()
+    client.config.link_rewrites = configured
+    client.get_wiki_page.return_value = "[wiki:Other Other]"
+    client.get_wiki_page_html.return_value = _LINKS_HTML
+    client.get_wiki_page_info.return_value = {"version": 2}
+    return client
+
+
+class TestPullLinkRewrites:
+    async def test_no_map_anywhere_rewrites_nothing(self, tmp_path):
+        result, text = await _pull(_links_client(), tmp_path)
+        assert (
+            result.structuredContent["link_rewrites_source"] == "none"
+        )
+        assert f"[Other]({_PREFIX}Other)" in text
+
+    async def test_the_configured_map_applies_when_the_call_has_none(
+        self, tmp_path
+    ):
+        client = _links_client(((_RULE["from"], _RULE["to"]),))
+        result, text = await _pull(client, tmp_path)
+        assert result.structuredContent["link_rewrites_source"] == (
+            "config"
+        )
+        assert "[Other](https://blog.example/Other)" in text
+
+    async def test_the_call_replaces_the_configured_map(self, tmp_path):
+        client = _links_client(
+            ((_RULE["from"], "https://cfg.example/"),)
+        )
+        result, text = await _pull(
+            client, tmp_path, link_rewrites=[_RULE]
+        )
+        assert (
+            result.structuredContent["link_rewrites_source"] == "call"
+        )
+        assert "[Other](https://blog.example/Other)" in text
+        assert "cfg.example" not in text
+
+    async def test_an_empty_call_list_disables_rewriting(
+        self, tmp_path
+    ):
+        client = _links_client(((_RULE["from"], _RULE["to"]),))
+        result, text = await _pull(client, tmp_path, link_rewrites=[])
+        assert (
+            result.structuredContent["link_rewrites_source"] == "call"
+        )
+        assert f"[Other]({_PREFIX}Other)" in text
+
+    async def test_an_in_page_anchor_and_an_image_are_never_rewritten(
+        self, tmp_path
+    ):
+        rules = [
+            _RULE,
+            {"from": "#", "to": "https://blog.example/#"},
+            {"from": "http://localhost/trac/", "to": "/x/"},
+        ]
+        _, text = await _pull(
+            _links_client(), tmp_path, link_rewrites=rules
+        )
+        assert "[Heading](#Heading)" in text
+        assert (
+            "![i](http://localhost/trac/raw-attachment/wiki/P/i.png)"
+            in text
+        )
+        assert "[Other](https://blog.example/Other)" in text
+
+    async def test_tracwiki_ignores_the_map_and_reports_none(
+        self, tmp_path
+    ):
+        client = _links_client(((_RULE["from"], _RULE["to"]),))
+        result, text = await _pull(
+            client, tmp_path, format="tracwiki", link_rewrites=[_RULE]
+        )
+        assert (
+            result.structuredContent["link_rewrites_source"] == "none"
+        )
+        assert text == "[wiki:Other Other]"
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            [{"from": "", "to": "x"}],
+            [_RULE, _RULE],
+            [{"from": 1, "to": "x"}],
+            [{"from": "a", "to": 2}],
+            [{"from": "a"}],
+            ["a=b"],
+            "a=b",
+        ],
+    )
+    async def test_a_bad_rule_is_a_validation_error_before_any_read(
+        self, tmp_path, bad
+    ):
+        client = _links_client()
+        result, text = await _pull(client, tmp_path, link_rewrites=bad)
+        assert result.isError is True
+        assert "validation_error" in result.content[0].text
+        assert "link_rewrites" in result.content[0].text
+        assert text is None
+        client.get_wiki_page_html.assert_not_called()
+
+    def test_the_input_schema_declares_link_rewrites(self):
+        from trac_mcp_server.mcp.tools.wiki_file import WIKI_FILE_TOOLS
+
+        tool = next(
+            t for t in WIKI_FILE_TOOLS if t.name == "wiki_file_pull"
+        )
+        prop = tool.inputSchema["properties"]["link_rewrites"]
+        assert prop["type"] == "array"
+        assert prop["items"]["required"] == ["from", "to"]
+        assert "link_rewrites_source" in tool.description
+
+
+_HTML_FRAGMENT = (
+    '<h1 id="Title">Title</h1>\n'
+    '<p>\n<a class="wiki" href="http://localhost/trac/wiki/Other">'
+    "Other</a> &amp; <strong>bold</strong>\n</p>\n"
+)
+
+
+def _html_client(info=None, configured=()):
+    client = _make_client()
+    client.config.link_rewrites = configured
+    client.get_wiki_page.return_value = "SOURCE MUST NOT BE READ"
+    client.get_wiki_page_html.return_value = _HTML_FRAGMENT
+    client.get_wiki_page_info.return_value = (
+        {"version": 6} if info is None else info
+    )
+    return client
+
+
+class TestPullHtml:
+    """format=html is Trac's own render, as a minimal document (#211)."""
+
+    async def test_the_document_wraps_the_fragment_exactly(
+        self, tmp_path
+    ):
+        result, text = await _pull(
+            _html_client(), tmp_path, format="html"
+        )
+
+        assert not result.isError, result.content
+        assert text == (
+            "<!doctype html>\n"
+            "<html>\n"
+            "<head>\n"
+            '<meta charset="utf-8">\n'
+            "<title>TestPage</title>\n"
+            "</head>\n"
+            "<body>\n" + _HTML_FRAGMENT + "</body></html>\n"
+        )
+        sc = result.structuredContent
+        assert sc["format"] == "html"
+        assert sc["version"] == 6
+        assert sc["converted"] is True
+        assert sc["warnings"] == []
+
+    async def test_trac_own_html_body_wrapper_is_unwrapped(
+        self, tmp_path
+    ):
+        """Real getPageHTML answers ``<html><body>...</body></html>``
+        itself (found on stage); the document has one of each."""
+        inner = (
+            '<h1 class="section" id="Stagecheck">Stage check</h1>\n'
+            "<p>\nA link to "
+            '<a class="wiki" '
+            'href="http://trac.example.org/trac_test/wiki/WikiStart">'
+            "the start page</a> and <em>italic</em> text.\n</p>\n"
+        )
+        client = _html_client()
+        client.get_wiki_page_html.return_value = (
+            "<html><body>" + inner + "</body></html>"
+        )
+        result, text = await _pull(client, tmp_path, format="html")
+
+        assert not result.isError, result.content
+        assert text == (
+            "<!doctype html>\n<html>\n<head>\n"
+            '<meta charset="utf-8">\n<title>TestPage</title>\n'
+            "</head>\n<body>\n" + inner + "</body></html>\n"
+        )
+        assert text.count("<html") == 1
+        assert text.count("<body") == 1
+
+    @pytest.mark.parametrize(
+        "wrapped",
+        [
+            "  \n<HTML><BODY>{inner}</BODY></HTML>\n  ",
+            "<html>\n<body>\n{inner}</body>\n</html>",
+            "<Html >\t<Body>{inner}</Body>\r\n</Html>\n",
+        ],
+    )
+    async def test_the_wrapper_is_matched_ignoring_case_and_whitespace(
+        self, tmp_path, wrapped
+    ):
+        inner = "<p>\ninner <b>kept</b>\n</p>\n"
+        client = _html_client()
+        client.get_wiki_page_html.return_value = wrapped.format(
+            inner=inner
+        )
+        _, text = await _pull(client, tmp_path, format="html")
+
+        assert text.lower().count("<html") == 1
+        assert text.lower().count("<body") == 1
+        body = text.split("<body>\n", 1)[1]
+        assert body.endswith("</body></html>\n")
+        assert "inner <b>kept</b>" in body
+        assert text.count("</body>") == 1
+
+    async def test_a_bare_fragment_passes_through(self, tmp_path):
+        # Trac's wikiToHtml (ticket text) and older Tracs: no wrapper.
+        result, text = await _pull(
+            _html_client(), tmp_path, format="html"
+        )
+        assert text.count("<body") == 1
+        assert "<body>\n" + _HTML_FRAGMENT + "</body></html>\n" in text
+
+    @pytest.mark.parametrize(
+        "slug",
+        ["stock_TracCgi", "stock_WikiFormatting", "stock_TracLinks"],
+    )
+    async def test_a_real_getpagehtml_capture_is_unwrapped(
+        self, tmp_path, slug
+    ):
+        raw = (_FIXTURES / f"{slug}.html").read_text(encoding="utf-8")
+        assert raw.startswith("<html><body>")
+        assert raw.rstrip().endswith("</body></html>")
+        inner = raw.rstrip()[
+            len("<html><body>") : -len("</body></html>")
+        ]
+        client = _html_client()
+        client.get_wiki_page_html.return_value = raw
+        result, text = await _pull(client, tmp_path, format="html")
+
+        assert not result.isError, result.content
+        assert text.count("<html") == 1
+        assert text.count("<body") == 1
+        assert text.endswith(inner + "</body></html>\n")
+        assert "<body>\n" + inner in text
+
+    @pytest.mark.parametrize(
+        "prefix",
+        [
+            "",
+            "\ufeff",
+            "<!doctype html>\n",
+            '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"\n'
+            ' "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">\n',
+            '<?xml version="1.0" encoding="utf-8"?>\n',
+            '\ufeff<?xml version="1.0"?>\n<!doctype html>\n',
+            '<!doctype html><?xml version="1.0"?>',
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("html_open", "body_open"),
+        [
+            ("<html>", "<body>"),
+            (
+                '<html lang="en" xmlns="http://www.w3.org/1999/xhtml">',
+                "<body>",
+            ),
+            ("<html>", '<body class="wiki" onload="x()">'),
+            ("<HTML\n  lang=en>", "\n<BODY\tid=b >"),
+        ],
+    )
+    async def test_the_wrapper_with_attributes_bom_or_prolog_is_unwrapped(
+        self, tmp_path, prefix, html_open, body_open
+    ):
+        inner = '<h1 id="X">X</h1>\n<p>\nbody &amp; text\n</p>\n'
+        client = _html_client()
+        client.get_wiki_page_html.return_value = (
+            prefix + html_open + body_open + inner + "</body></html>"
+        )
+        _, text = await _pull(client, tmp_path, format="html")
+
+        assert text.lower().count("<html") == 1
+        assert text.lower().count("<body") == 1
+        assert text.count("<!doctype") == 1
+        assert text.endswith("<body>\n" + inner + "</body></html>\n")
+        assert "xmlns" not in text and "onload" not in text
+        assert "\ufeff" not in text and "<?xml" not in text
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "<html><head><title>t</title></head><body>x</body></html>",
+            "<html><body>x</body></html> trailing",
+            "<body>x</body>",
+            "<htmlx><body>x</body></htmlx>",
+        ],
+    )
+    async def test_anything_else_passes_through_unchanged(
+        self, tmp_path, raw
+    ):
+        client = _html_client()
+        client.get_wiki_page_html.return_value = raw
+        _, text = await _pull(client, tmp_path, format="html")
+        assert text.endswith("<body>\n" + raw + "</body></html>\n")
+
+    async def test_the_title_is_the_escaped_page_name(self, tmp_path):
+        client = _html_client()
+        out = tmp_path / "out.html"
+        result = await _registry.call_tool(
+            "wiki_file_pull",
+            {
+                "page_name": "A<b>&Page",
+                "file_path": str(out),
+                "format": "html",
+            },
+            client,
+        )
+        assert not result.isError, result.content
+        text = out.read_text()
+        assert "<title>A&lt;b&gt;&amp;Page</title>" in text
+        assert "A<b>" not in text
+
+    async def test_the_html_is_pinned_to_the_info_version(
+        self, tmp_path
+    ):
+        client = _html_client({"version": 9})
+        await _pull(client, tmp_path, format="html")
+        client.get_wiki_page_info.assert_called_once_with(
+            "TestPage", None
+        )
+        client.get_wiki_page_html.assert_called_once_with("TestPage", 9)
+
+    async def test_a_requested_version_is_passed_to_the_info_read(
+        self, tmp_path
+    ):
+        client = _html_client({"version": 2})
+        result, _ = await _pull(
+            client, tmp_path, format="html", version=2
+        )
+        client.get_wiki_page_info.assert_called_once_with("TestPage", 2)
+        client.get_wiki_page_html.assert_called_once_with("TestPage", 2)
+        assert result.structuredContent["version"] == 2
+
+    @pytest.mark.parametrize("info", [{}, 0, None, {"version": 0}])
+    async def test_an_unreadable_version_falls_back_and_warns(
+        self, tmp_path, info
+    ):
+        client = _html_client(info)
+        # None would be taken for "default" by the helper.
+        client.get_wiki_page_info.return_value = info
+        result, text = await _pull(client, tmp_path, format="html")
+
+        assert not result.isError, result.content
+        assert text.startswith("<!doctype html>\n")
+        warnings = result.structuredContent["warnings"]
+        assert len(warnings) == 1
+        assert "version could not be read" in warnings[0]
+        assert "not pinned" in warnings[0]
+        assert warnings[0] in result.content[0].text
+        client.get_wiki_page_html.assert_called_once_with(
+            "TestPage", None
+        )
+
+    async def test_no_source_is_read(self, tmp_path):
+        client = _html_client()
+        await _pull(client, tmp_path, format="html")
+        client.get_wiki_page.assert_not_called()
+
+    async def test_link_rewrites_are_ignored_and_not_validated(
+        self, tmp_path
+    ):
+        client = _html_client(
+            configured=((_RULE["from"], _RULE["to"]),)
+        )
+        result, text = await _pull(
+            client,
+            tmp_path,
+            format="html",
+            link_rewrites=[{"from": "", "to": 1}],
+        )
+        assert not result.isError, result.content
+        assert (
+            result.structuredContent["link_rewrites_source"] == "none"
+        )
+        assert 'href="http://localhost/trac/wiki/Other"' in text
+
+    @pytest.mark.parametrize("where", ["info", "html"])
+    async def test_not_found_from_a_read_is_not_found(
+        self, tmp_path, where
+    ):
+        client = _html_client()
+        fault = xmlrpc.client.Fault(1, "Page TestPage does not exist")
+        if where == "info":
+            client.get_wiki_page_info.side_effect = fault
+        else:
+            client.get_wiki_page_html.side_effect = fault
+        result, text = await _pull(client, tmp_path, format="html")
+        assert result.isError is True
+        assert "not_found" in result.content[0].text
+        assert text is None
+
+    def test_the_input_schema_offers_html_and_defaults_to_markdown(
+        self,
+    ):
+        from trac_mcp_server.mcp.tools.wiki_file import WIKI_FILE_TOOLS
+
+        tool = next(
+            t for t in WIKI_FILE_TOOLS if t.name == "wiki_file_pull"
+        )
+        prop = tool.inputSchema["properties"]["format"]
+        assert prop["enum"] == ["markdown", "html", "tracwiki"]
+        assert prop["default"] == "markdown"
+        assert 'format="html"' in tool.description
+        for name in ("markdown", "html", "tracwiki"):
+            assert name in prop["description"]
+
+    async def test_the_default_format_is_still_markdown(self, tmp_path):
+        result, text = await _pull(_html_client(), tmp_path)
+        assert result.structuredContent["format"] == "markdown"
+        assert not text.startswith("<!doctype")
+
+
+class TestPullReportedVersion:
+    """With a version asked for and no usable info, the version reported
+    is the requested one, not 1; unpinned it is still 1 (Trac #211)."""
+
+    @pytest.mark.parametrize("fmt", ["markdown", "html", "tracwiki"])
+    @pytest.mark.parametrize("info", [{}, 0, None, {"version": 0}])
+    async def test_the_requested_version_is_reported(
+        self, tmp_path, fmt, info
+    ):
+        client = _html_client(info)
+        client.get_wiki_page_info.return_value = info
+        client.get_wiki_page.return_value = "= Hello ="
+        result, _ = await _pull(client, tmp_path, format=fmt, version=4)
+
+        assert not result.isError, result.content
+        assert result.structuredContent["version"] == 4
+        # Pinned by the request: nothing to warn about.
+        assert result.structuredContent["warnings"] == []
+
+    @pytest.mark.parametrize("fmt", ["markdown", "html", "tracwiki"])
+    async def test_the_infos_version_wins_when_usable(
+        self, tmp_path, fmt
+    ):
+        client = _html_client({"version": 9})
+        client.get_wiki_page.return_value = "= Hello ="
+        result, _ = await _pull(client, tmp_path, format=fmt, version=4)
+        assert result.structuredContent["version"] == 9
+
+    @pytest.mark.parametrize("fmt", ["markdown", "html", "tracwiki"])
+    async def test_unpinned_and_unreadable_keeps_the_fallback_of_1(
+        self, tmp_path, fmt
+    ):
+        client = _html_client({})
+        client.get_wiki_page_info.return_value = {}
+        client.get_wiki_page.return_value = "= Hello ="
+        result, _ = await _pull(client, tmp_path, format=fmt)
+        assert result.structuredContent["version"] == 1
+        warned = result.structuredContent["warnings"]
+        # tracwiki reads no HTML and has never warned.
+        assert len(warned) == (0 if fmt == "tracwiki" else 1)
+
+
+class TestPullWarningsHeading:
+    @pytest.mark.parametrize(
+        ("fmt", "heading"),
+        [
+            ("markdown", "Conversion warnings:"),
+            ("html", "Warnings:"),
+        ],
+    )
+    async def test_the_heading_names_what_the_warnings_are(
+        self, tmp_path, fmt, heading
+    ):
+        client = _html_client({})
+        client.get_wiki_page_info.return_value = {}
+        client.get_wiki_page.return_value = "= Hello ="
+        result, _ = await _pull(client, tmp_path, format=fmt)
+        text = result.content[0].text
+        assert f"\n\n{heading}\n- " in text
+        if fmt == "html":
+            assert "Conversion warnings" not in text
+
+
+class TestPullInPageAnchors:
+    """Trac renders ``[#Frag x]`` as ``<page URL>#Frag``; the pull writes
+    it ``#Frag`` and never rewrites it (Trac #213)."""
+
+    @staticmethod
+    def _client(trac_url, page, html_name):
+        client = _make_client()
+        client.config.trac_url = trac_url
+        client.get_wiki_page.return_value = "src"
+        client.get_wiki_page_info.return_value = {"version": 2}
+        base = trac_url.rstrip("/")
+        client.get_wiki_page_html.return_value = (
+            f'<p><a href="{base}/wiki/{html_name}#Linkrow">h</a> '
+            f'<a href="{base}/wiki/WikiStart#Top">o</a></p>\n'
+        )
+        return client
+
+    async def test_the_page_url_anchor_is_relative_and_unmapped(
+        self, tmp_path
+    ):
+        client = self._client(
+            "http://localhost/trac", "TestPage", "TestPage"
+        )
+        rules = [{"from": "http://localhost/trac/", "to": "https://b/"}]
+        result, text = await _pull(
+            client, tmp_path, link_rewrites=rules
+        )
+        assert "[h](#Linkrow)" in text
+        assert "[o](https://b/wiki/WikiStart#Top)" in text
+
+    async def test_the_document_url_is_the_routed_instances_wiki_url(
+        self, tmp_path
+    ):
+        # A per-instance config: another base, with a trailing slash.
+        seen = {}
+
+        def spy(html, source=None, **kw):
+            seen.update(kw)
+            return trac_html_to_markdown(html, source, **kw)
+
+        client = self._client(
+            "http://other.example/trac_two/", "TestPage", "TestPage"
+        )
+        with patch(
+            "trac_mcp_server.mcp.tools.wiki_file.trac_html_to_markdown",
+            spy,
+        ):
+            _, text = await _pull(client, tmp_path)
+        assert seen["document_url"] == (
+            "http://other.example/trac_two/wiki/TestPage"
+        )
+        assert "[h](#Linkrow)" in text
+
+    async def test_trac_url_host_may_differ_from_the_daemons(
+        self, tmp_path
+    ):
+        # The daemon reaches Trac at a LAN address; Trac builds its
+        # hrefs from its own public base URL. Only the path is compared.
+        client = self._client(
+            "http://10.0.0.5/auto_pm", "TestPage", "TestPage"
+        )
+        client.get_wiki_page_html.return_value = (
+            '<p><a href="https://trac.example/auto_pm/wiki/TestPage'
+            '#Sec">h</a> <a href="https://trac.example/auto_pm/wiki/'
+            'Other#Sec">o</a></p>\n'
+        )
+        rules = [
+            {
+                "from": "https://trac.example/auto_pm/wiki/",
+                "to": "https://b/",
+            }
+        ]
+        _, text = await _pull(client, tmp_path, link_rewrites=rules)
+        assert "[h](#Sec)" in text
+        assert "[o](https://b/Other#Sec)" in text
+
+    async def test_a_page_name_with_a_space_matches_trac_encoding(
+        self, tmp_path
+    ):
+        client = self._client(
+            "http://localhost/trac", "x", "Scratch/Page%20Two"
+        )
+        out = tmp_path / "out.md"
+        result = await _registry.call_tool(
+            "wiki_file_pull",
+            {"page_name": "Scratch/Page Two", "file_path": str(out)},
+            client,
+        )
+        assert not result.isError
+        assert "[h](#Linkrow)" in out.read_text()
 
 
 class TestPushThroughConditionalPut:
@@ -1316,3 +2285,301 @@ class TestPushThroughConditionalPut:
             in text
         )
         assert methods == ["getPageInfo", "putPageIfVersion"]
+
+
+# =============================================================================
+# Front matter on a Markdown pull, and the push refusal (Trac #212)
+# =============================================================================
+
+_FM_HTML = (
+    '<h1 class="section" id="Hello">Hello Page'
+    '<a class="anchor" href="#Hello" title="Link to this section"> '
+    "\u00b6</a></h1>\n<p>\nBody text.\n</p>\n"
+)
+_FM_HTML_NO_H1 = '<h2 id="Sub">Sub</h2>\n<p>\nBody text.\n</p>\n'
+_ISO_Z = r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
+
+
+def _fm_client(html=_FM_HTML, info=None, trac_url="http://h:8000/proj"):
+    client = _make_client()
+    client.config.trac_url = trac_url
+    client.get_wiki_page.return_value = "= Hello Page =\n\nBody text.\n"
+    client.get_wiki_page_html.return_value = html
+    client.get_wiki_page_info.return_value = (
+        {"version": 7} if info is None else info
+    )
+    return client
+
+
+async def _fm_pull(client, tmp_path, **extra):
+    result, text = await _pull(client, tmp_path, **extra)
+    assert not result.isError, result.content
+    return text
+
+
+def _fm_block(text):
+    import yaml
+
+    assert text.startswith("---\n")
+    head, _, rest = text[4:].partition("\n---\n")
+    return yaml.safe_load(head), rest
+
+
+class TestPullFrontMatter:
+    """A Markdown pull starts with front matter naming its page (#212)."""
+
+    async def test_markdown_pull_starts_with_the_front_matter(
+        self, tmp_path
+    ):
+        import re
+
+        text = await _fm_pull(_fm_client(), tmp_path)
+
+        meta, rest = _fm_block(text)
+        assert list(meta) == [
+            "title",
+            "source",
+            "trac_instance",
+            "trac_page",
+            "trac_version",
+            "exported",
+        ]
+        assert meta["title"] == "Hello Page"
+        assert meta["source"] == "http://h:8000/proj/wiki/TestPage"
+        assert meta["trac_instance"] == "/proj"
+        assert meta["trac_page"] == "TestPage"
+        assert meta["trac_version"] == 7
+        assert re.fullmatch(_ISO_Z, meta["exported"])
+        # The raw text has the exported stamp as a quoted string.
+        assert re.search(rf'^exported: "{_ISO_Z}"$', text, re.M)
+        assert rest.startswith("\n# Hello Page")
+
+    async def test_source_is_percent_encoded_for_an_awkward_page_name(
+        self, tmp_path
+    ):
+        client = _fm_client()
+        out = tmp_path / "out.md"
+
+        result = await _registry.call_tool(
+            "wiki_file_pull",
+            {"page_name": "Notes/Q3 #2", "file_path": str(out)},
+            client,
+        )
+
+        assert not result.isError, result.content
+        meta, _ = _fm_block(out.read_text())
+        assert (
+            meta["source"] == "http://h:8000/proj/wiki/Notes/Q3%20%232"
+        )
+        assert meta["trac_page"] == "Notes/Q3 #2"
+
+    async def test_the_markdown_after_the_block_is_the_translator_output(
+        self, tmp_path
+    ):
+        expected = trac_html_to_markdown(
+            _FM_HTML, "= Hello Page =\n\nBody text.\n"
+        )
+
+        text = await _fm_pull(_fm_client(), tmp_path)
+
+        assert text.endswith("---\n\n" + expected.text)
+
+    async def test_title_falls_back_to_the_page_name(self, tmp_path):
+        text = await _fm_pull(_fm_client(html=_FM_HTML_NO_H1), tmp_path)
+
+        meta, _ = _fm_block(text)
+        assert meta["title"] == "TestPage"
+
+    async def test_unpinned_version_is_null(self, tmp_path):
+        client = _fm_client(info={})
+
+        result, text = await _pull(client, tmp_path)
+
+        assert not result.isError
+        assert "\ntrac_version: null\n" in text
+        meta, _ = _fm_block(text)
+        assert meta["trac_version"] is None
+
+    async def test_asked_for_version_is_the_pinned_one(self, tmp_path):
+        client = _fm_client(info={})
+
+        result, text = await _pull(client, tmp_path, version=4)
+
+        assert not result.isError
+        meta, _ = _fm_block(text)
+        assert meta["trac_version"] == 4
+
+    @pytest.mark.parametrize("fmt", ["html", "tracwiki"])
+    async def test_other_formats_have_none(self, tmp_path, fmt):
+        client = _fm_client()
+
+        result, text = await _pull(client, tmp_path, format=fmt)
+
+        assert not result.isError
+        assert "trac_page" not in text
+        assert not text.startswith("---")
+
+    def test_tool_description_says_so(self):
+        pull = next(
+            s.tool
+            for s in WIKI_FILE_SPECS
+            if s.tool.name == "wiki_file_pull"
+        )
+        assert "front matter" in pull.description
+        assert "trac_page" in pull.description
+        assert "force=true" in pull.description
+
+
+_FM_EXPORT = (
+    "---\n"
+    'title: "Hello Page"\n'
+    'source: "http://h:8000/proj/wiki/TestPage"\n'
+    'trac_instance: "/proj"\n'
+    'trac_page: "TestPage"\n'
+    "trac_version: 7\n"
+    'exported: "2026-11-09T12:00:00Z"\n'
+    "---\n\n# Hello Page\n\nBody text.\n"
+)
+
+
+async def _fm_push(content, name="x.md", **extra):
+    client = _make_client()
+    client.get_wiki_page_info.return_value = {"version": 3}
+    client.put_wiki_page.return_value = {
+        "version": 4,
+        "name": "TestPage",
+    }
+    args = {"content": content, "page_name": "TestPage", **extra}
+    if name is not None:
+        args["filename"] = name
+    result = await _registry.call_tool("wiki_file_push", args, client)
+    return client, result
+
+
+class TestPushRefusesExportedMarkdown:
+    """Markdown whose front matter carries trac_page is refused (#212)."""
+
+    async def test_pulled_markdown_is_refused(self):
+        client, result = await _fm_push(_FM_EXPORT)
+
+        assert result.isError
+        text = result.content[0].text
+        assert "Error (validation_error)" in text
+        assert "'TestPage'" in text
+        assert "instance /proj" in text
+        assert "version 7" in text
+        assert "one-way" in text
+        assert "wiki_get(page_name='TestPage')" in text
+        assert "force=true" in text
+        client.put_wiki_page.assert_not_called()
+        client.get_wiki_page_info.assert_not_called()
+        client.get_wiki_page.assert_not_called()
+
+    async def test_missing_instance_and_version_read_unknown(self):
+        content = '---\ntrac_page: "P"\n---\n\nBody\n'
+
+        client, result = await _fm_push(content)
+
+        assert result.isError
+        text = result.content[0].text
+        assert "instance unknown" in text
+        assert "version unknown" in text
+        client.put_wiki_page.assert_not_called()
+
+    async def test_refused_whatever_the_format(self):
+        client, result = await _fm_push(_FM_EXPORT, format="tracwiki")
+
+        assert result.isError
+        assert "Error (validation_error)" in result.content[0].text
+        client.put_wiki_page.assert_not_called()
+
+    async def test_refused_without_stripping(self):
+        client, result = await _fm_push(
+            _FM_EXPORT, strip_frontmatter=False
+        )
+
+        assert result.isError
+        assert "Error (validation_error)" in result.content[0].text
+        client.put_wiki_page.assert_not_called()
+
+    async def test_refused_from_a_server_file_too(self, tmp_path):
+        md = tmp_path / "x.md"
+        md.write_text(_FM_EXPORT)
+        client = _make_client()
+
+        result = await _registry.call_tool(
+            "wiki_file_push",
+            {"file_path": str(md), "page_name": "TestPage"},
+            client,
+        )
+
+        assert result.isError
+        client.put_wiki_page.assert_not_called()
+
+    async def test_force_pushes_it_without_the_front_matter(self):
+        client, result = await _fm_push(_FM_EXPORT, force=True)
+
+        assert not result.isError, result.content
+        assert result.structuredContent["version"] == 4
+        client.put_wiki_page.assert_called_once()
+        stored = client.put_wiki_page.call_args[0][1]
+        assert "trac_page" not in stored
+        assert not stored.startswith("---")
+        assert "Hello Page" in stored
+
+    async def test_plain_markdown_pushes_as_before(self):
+        client, result = await _fm_push("# Hello\n\nWorld\n")
+
+        assert not result.isError, result.content
+        client.put_wiki_page.assert_called_once()
+
+    async def test_hugo_front_matter_is_stripped_not_refused(self):
+        content = "---\ntitle: Post\ndate: 2026-01-01\n---\n\n# Hello\n\nWorld\n"
+
+        client, result = await _fm_push(content)
+
+        assert not result.isError, result.content
+        stored = client.put_wiki_page.call_args[0][1]
+        assert "date:" not in stored
+        assert "Hello" in stored
+
+    async def test_impossible_date_in_front_matter_is_stripped(self):
+        content = "---\ntitle: Post\ndate: 2024-02-30\n---\n\n# Hello\n\nWorld\n"
+
+        client, result = await _fm_push(content)
+
+        assert not result.isError, result.content
+        stored = client.put_wiki_page.call_args[0][1]
+        assert "date:" not in stored
+        assert not stored.startswith("---")
+        assert "Hello" in stored
+
+    def test_schema_has_force_default_false(self):
+        push = next(
+            s.tool
+            for s in WIKI_FILE_SPECS
+            if s.tool.name == "wiki_file_push"
+        )
+        force = push.inputSchema["properties"]["force"]
+        assert force["type"] == "boolean"
+        assert force["default"] is False
+        assert "trac_page" in force["description"]
+        assert "force=true" in push.description
+
+
+class TestStripYamlFrontmatterForms:
+    """_strip_yaml_frontmatter is split_front_matter's remainder (#212)."""
+
+    def test_crlf(self):
+        assert _strip_yaml_frontmatter(
+            "---\r\nx: 1\r\n---\r\n# T\r\n"
+        ) == ("# T\r\n")
+
+    def test_bom(self):
+        assert (
+            _strip_yaml_frontmatter("\ufeff---\nx: 1\n---\n# T")
+            == "# T"
+        )
+
+    def test_closing_fence_at_end_of_text(self):
+        assert _strip_yaml_frontmatter("---\nx: 1\n---") == ""

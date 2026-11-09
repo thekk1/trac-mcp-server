@@ -185,6 +185,59 @@ class TestHandleDelete(unittest.TestCase):
                 "tracopt.ticket.deleter", result.content[0].text
             )
 
+    def test_handle_delete_real_403_shape_is_permission_denied(self):
+        """TracXMLRPC's real PermissionError, Fault(403, ...), is
+        classified by its code (Trac #191)."""
+        mock_client = MagicMock()
+
+        with patch(
+            "trac_mcp_server.mcp.tools.ticket_write.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = [
+                True,
+                xmlrpc.client.Fault(
+                    403,
+                    "TICKET_ADMIN privileges are required to perform "
+                    "this operation on Ticket #5",
+                ),
+            ]
+
+            result = asyncio.run(
+                _handle_delete(mock_client, {"ticket_id": 5})
+            )
+
+            self.assertTrue(result.isError)
+            self.assertIn(
+                "Error (permission_denied)", result.content[0].text
+            )
+            self.assertIn(
+                "tracopt.ticket.deleter", result.content[0].text
+            )
+
+    def test_handle_delete_code_1_quoted_name_is_not_permission(self):
+        """A code-1 fault is any TracError, and a name it quotes that
+        contains 'Permission' is no evidence of a permission fault: the
+        fault propagates instead of the permission_denied response
+        (Trac #191)."""
+        fault = xmlrpc.client.Fault(
+            1,
+            "'Invalid ticket field 'PermissionNotes'' while "
+            "executing 'ticket.delete()'",
+        )
+        mock_client = MagicMock()
+
+        with patch(
+            "trac_mcp_server.mcp.tools.ticket_write.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = [True, fault]
+
+            with self.assertRaises(xmlrpc.client.Fault) as ctx:
+                asyncio.run(
+                    _handle_delete(mock_client, {"ticket_id": 5})
+                )
+
+            self.assertIs(ctx.exception, fault)
+
 
 # ---------------------------------------------------------------------------
 # Ticket Create handler tests
@@ -1530,20 +1583,9 @@ async def test_live_chained_update_uses_returned_token():
     """Real Trac (/trac_test): the token ticket_update returns is the
     one Trac now holds -- a second write with it lands, and the
     superseded token is refused (ticket #127)."""
-    import os
-    from urllib.parse import urlparse
+    from tests.live_helpers import trac_test_config
 
-    # The destructive-test instance on the same host, whatever project
-    # or sub-path TRAC_URL itself names.
-    parsed = urlparse(os.environ["TRAC_URL"])
-    config = Config(
-        trac_url=f"{parsed.scheme}://{parsed.netloc}/trac_test",
-        username=os.environ["TRAC_USERNAME"],
-        password=os.environ["TRAC_PASSWORD"],
-        insecure=os.environ.get("TRAC_INSECURE", "").lower()
-        in ("1", "true", "yes"),
-    )
-    client = TracClient(config)
+    client = TracClient(trac_test_config())
     ticket_id = client.create_ticket(
         "#127 live test: chained ticket_update",
         "Throwaway; deleted by the test.",
@@ -2676,18 +2718,9 @@ async def test_live_update_reports_comment_number_and_stored_bytes():
     number 1 with an empty comment, so the comment that follows is number
     2, and the byte-for-byte verdict agrees with the changelog (ticket
     #124)."""
-    import os
-    from urllib.parse import urlparse
+    from tests.live_helpers import trac_test_config
 
-    parsed = urlparse(os.environ["TRAC_URL"])
-    config = Config(
-        trac_url=f"{parsed.scheme}://{parsed.netloc}/trac_test",
-        username=os.environ["TRAC_USERNAME"],
-        password=os.environ["TRAC_PASSWORD"],
-        insecure=os.environ.get("TRAC_INSECURE", "").lower()
-        in ("1", "true", "yes"),
-    )
-    client = TracClient(config)
+    client = TracClient(trac_test_config())
     ticket_id = client.create_ticket(
         "#124 live test: comment number",
         "Throwaway; deleted by the test.",
@@ -4605,6 +4638,63 @@ class TestHandleTicketActions:
             assert isinstance(result, types.CallToolResult)
             assert result.isError is True
             assert "method_not_available" in result.content[0].text
+
+    def test_actions_real_missing_method_fault(self):
+        """TracXMLRPC's real MethodNotFound, code -32601 naming
+        ticket.getActions, is method_not_available (Trac #191)."""
+        client = MagicMock(spec=TracClient)
+
+        with patch(
+            "trac_mcp_server.mcp.tools.ticket_read.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = xmlrpc.client.Fault(
+                -32601, 'RPC method "ticket.getActions" not found'
+            )
+
+            result = self._run(
+                _handle_actions(client, {"ticket_id": 5})
+            )
+
+            assert result.isError is True
+            assert "method_not_available" in result.content[0].text
+
+    def test_actions_unprefixed_missing_method_fault(self):
+        """A server whose text omits the service prefix ("No such
+        method: getActions") still counts as a missing method (Trac
+        #191)."""
+        client = MagicMock(spec=TracClient)
+
+        with patch(
+            "trac_mcp_server.mcp.tools.ticket_read.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = xmlrpc.client.Fault(
+                1, "No such method: getActions"
+            )
+
+            result = self._run(
+                _handle_actions(client, {"ticket_id": 5})
+            )
+
+            assert result.isError is True
+            assert "method_not_available" in result.content[0].text
+
+    def test_actions_resource_fault_is_not_a_missing_method(self):
+        """A resource fault whose text says "not found" (here a missing
+        ticket) is no missing method: it propagates instead of
+        reporting that workflow introspection is unavailable (Trac
+        #191)."""
+        client = MagicMock(spec=TracClient)
+        fault = xmlrpc.client.Fault(404, "Ticket 999 not found")
+
+        with patch(
+            "trac_mcp_server.mcp.tools.ticket_read.run_sync"
+        ) as mock_run_sync:
+            mock_run_sync.side_effect = fault
+
+            with pytest.raises(xmlrpc.client.Fault) as exc_info:
+                self._run(_handle_actions(client, {"ticket_id": 999}))
+
+            assert exc_info.value is fault
 
     def test_actions_with_hints_and_input_fields(self):
         """Actions with list hints and input fields are formatted correctly."""

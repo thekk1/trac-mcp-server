@@ -14,26 +14,40 @@ verbosity flags (--quiet, --verbose) on top of this skeleton.
 
 import argparse
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pyperclip
 
 from .. import __version__
 from ..config_bootstrap import bootstrap_config
-from ..converters import (
-    detect_format_heuristic,
-    tracwiki_to_markdown,
-)
+from ..converters import detect_format_heuristic
 from ..converters.common import (
     ConversionResult,
     describe_indentation_loss,
     find_code_block_indentation_loss,
 )
+from ..converters.front_matter import (
+    build_front_matter,
+    exported_from,
+    instance_path,
+    page_url,
+    split_front_matter,
+)
+from ..converters.html_to_markdown import trac_html_to_markdown
 from ..converters.markdown_to_tracwiki import convert_with_warnings
 from ..core.client import TracClient, WikiPageStoredReadbackFailed
+from ..link_rewrites import (
+    LinkRewrites,
+    as_dict,
+    link_map_arg,
+    parse_pairs,
+)
 
 # ---------------------------------------------------------------------------
 # Exit-code constants
@@ -261,13 +275,16 @@ def _classify_trac_error(
 
     Sub-classification precedence:
       1. xmlrpc.client.Fault:
-         - faultCode == 1 OR "not found"/"does not exist" in faultString
-           -> "wiki page not found: <page_name>" (falls back to
-              "resource not found (fault 1): <faultString>" when
-              page_name is None)
-         - "permission"/"denied" in faultString (case-insensitive)
+         Classified by ``classify_fault`` (codes first: 404/403; then
+         the fault text with TracXMLRPC's wrapper and every quoted name
+         removed). Code 1 alone is no evidence: TracXMLRPC sends it for
+         ANY TracError (Trac #189).
+         - "not_found" -> "wiki page not found: <page_name>" (falls
+           back to "resource not found (fault <code>): <faultString>"
+           when page_name is None)
+         - "permission_denied"
            -> "Trac permission denied (<action>): <faultString>"
-         - default -> "Trac fault (<action>): <faultString>"
+         - anything else -> "Trac fault (<action>): <faultString>"
       2. requests.exceptions.SSLError -> "SSL error: <exc>"
       3. requests.exceptions.Timeout  -> "Trac request timed out (host: <url>): <exc>"
          MUST be tested before ConnectionError because ConnectTimeout
@@ -287,20 +304,19 @@ def _classify_trac_error(
 
     import requests.exceptions
 
+    from ..core.faults import classify_fault
+
     if isinstance(exc, xmlrpc.client.Fault):
         fault_str = exc.faultString
-        fault_str_lower = fault_str.lower()
-        if getattr(exc, "faultCode", None) == 1 or (
-            "not found" in fault_str_lower
-            or "does not exist" in fault_str_lower
-        ):
+        kind = classify_fault(exc)
+        if kind == "not_found":
             if page_name is not None:
                 return f"wiki page not found: {page_name}"
-            return f"resource not found (fault 1): {fault_str}"
-        if (
-            "permission" in fault_str_lower
-            or "denied" in fault_str_lower
-        ):
+            return (
+                f"resource not found (fault {exc.faultCode}): "
+                f"{fault_str}"
+            )
+        if kind == "permission_denied":
             return f"Trac permission denied ({action}): {fault_str}"
         return f"Trac fault ({action}): {fault_str}"
 
@@ -318,39 +334,225 @@ def _classify_trac_error(
     return f"{action} failed: {str(exc) or type(exc).__name__}"
 
 
-def _fetch_wiki_page(page_name: str, args) -> tuple[str | None, int]:
+#: What TracWiki -> Markdown says when it has no Trac to render with.
+_TRAC_REQUIRED_MESSAGE = (
+    "TracWiki -> Markdown needs a Trac connection: Trac renders the text"
+    " and trac-convert translates its HTML. Set TRAC_URL, TRAC_USERNAME,"
+    " TRAC_PASSWORD (or .trac_mcp/config.yaml), or pass --trac-url."
+    " Markdown -> TracWiki works offline."
+)
+
+
+class TracConnectionRequired(RuntimeError):
+    """TracWiki -> Markdown was asked for with no Trac to render it.
+
+    Trac's own HTML is what trac-convert translates (Trac
+    /trac_mcp_server #210), so this direction cannot run offline.
+
+    ``config_error`` is the text of the ``ValueError`` that
+    ``bootstrap_config`` raised, when there was one: a configuration that
+    exists but is invalid (a bad ``TRAC_URL``) is not the same as none,
+    and ``str(exc)`` carries it on a ``  config error:`` line.
+    """
+
+    def __init__(
+        self,
+        message: str = _TRAC_REQUIRED_MESSAGE,
+        config_error: str | None = None,
+    ) -> None:
+        self.config_error = config_error
+        super().__init__(
+            message
+            if config_error is None
+            else f"{message}\n  config error: {config_error}"
+        )
+
+
+class TracRenderError(RuntimeError):
+    """Trac was reached but rendering failed.
+
+    ``str(exc)`` is the ``_classify_trac_error`` message; it is empty
+    when the cause was already reported on stderr (an unreadable
+    ``--trac-password-file``).
+    """
+
+
+class _TracSession:
+    """The TracClient for one trac-convert run, opened on first use.
+
+    ``--from auto`` has to resolve before anyone knows whether Trac is
+    needed, and Markdown -> TracWiki never needs it, so nothing here
+    bootstraps config or builds a client until ``client()`` is called.
+    """
+
+    def __init__(self, args) -> None:
+        self._args = args
+        self._client: TracClient | None = None
+        self.url: str = ""
+        #: The page version ``--from-wiki`` pinned its reads to, or None
+        #: when none was pinned (see ``_fetch_wiki_page``).
+        self.page_version: int | None = None
+        #: Warnings the session itself raised, for ``main`` to print with
+        #: the converter's.
+        self.warnings: list[str] = []
+        #: ``--link-map`` (a replacement for the configured map) or, with
+        #: none, the configured ``export.link_rewrites`` /
+        #: ``TRAC_MCP_LINK_REWRITES``, which is known once ``client()``
+        #: has bootstrapped the config (Trac /trac_mcp_server #213).
+        self.explicit_link_map: LinkRewrites | None = None
+        self._configured_link_map: LinkRewrites = ()
+
+    def document_url(self, page_name: str | None = None) -> str:
+        """The URL Trac gives the document being converted: the page's
+        own URL for ``--from-wiki PAGE``, the instance root for text
+        rendered with no page (``wikiToHtml``). A link into it with a
+        ``#fragment`` is an in-page anchor (Trac /trac_mcp_server #213).
+        """
+        self.client()
+        base = self.url.rstrip("/")
+        return base if page_name is None else f"{base}/wiki/{page_name}"
+
+    def link_map(self) -> dict[str, str]:
+        """The link-rewrite map TracWiki -> Markdown applies.
+
+        Opens the client when it is not open yet, which the HTML read
+        that precedes the translation has always done.
+        """
+        self.client()
+        if self.explicit_link_map is not None:
+            return as_dict(self.explicit_link_map)
+        return as_dict(self._configured_link_map)
+
+    def client(self) -> TracClient:
+        """Return the client, opening it on the first call.
+
+        Raises ``TracConnectionRequired`` when no Trac is configured and
+        ``TracRenderError("")`` when ``--trac-password-file`` could not
+        be read (already reported on stderr).
+        """
+        if self._client is None:
+            overrides = _build_trac_overrides(self._args)
+            if overrides is None:
+                raise TracRenderError("")
+            try:
+                config, _ = bootstrap_config(overrides)
+            except ValueError as e:
+                raise TracConnectionRequired(
+                    config_error=str(e)
+                ) from None
+            self.url = config.trac_url
+            self._configured_link_map = config.link_rewrites
+            self._client = TracClient(config)
+        return self._client
+
+    def _render(
+        self,
+        call: Callable[[TracClient], str],
+        page_name: str | None = None,
+    ) -> str:
+        client = self.client()
+        try:
+            return call(client)
+        except Exception as e:
+            raise TracRenderError(
+                _classify_trac_error(
+                    e,
+                    self.url,
+                    page_name=page_name,
+                    action="wiki render",
+                )
+            ) from e
+
+    def render_text(self, text: str) -> str:
+        """Trac's HTML for ``text`` (file, stdin, clipboard input)."""
+        return self._render(lambda client: client.wiki_to_html(text))
+
+    def page_renderer(self, page_name: str) -> Callable[[str], str]:
+        """A renderer returning the HTML of wiki page ``page_name``.
+
+        ``--from-wiki``: the page renders with its own context, so
+        relative links resolve; the text passed in is the page's source,
+        which ``convert_text`` hands the translator for its code-block
+        languages. The HTML is read at ``page_version`` (pinned by
+        ``_fetch_wiki_page``), so it is the version that source is.
+        """
+        return lambda _text: self._render(
+            lambda client: client.get_wiki_page_html(
+                page_name, self.page_version
+            ),
+            page_name=page_name,
+        )
+
+
+def _usable_version(info) -> int | None:
+    """The page version in a ``get_wiki_page_info`` result, or None."""
+    version = info.get("version") if isinstance(info, dict) else None
+    if isinstance(version, int) and not isinstance(version, bool):
+        return version if version > 0 else None
+    return None
+
+
+def _fetch_wiki_page(
+    page_name: str,
+    args,
+    session: _TracSession | None = None,
+    *,
+    pin_version: bool = False,
+) -> tuple[str | None, int]:
     """Fetch a TracWiki page's raw source via TracClient.
 
     Reuses _build_trac_overrides() and bootstrap_config() so the same
     layered config precedence (CLI > env > YAML > defaults) that
-    --check-trac uses also applies here.
+    --check-trac uses also applies here. ``session`` is the run's
+    shared Trac session, so the HTML read that follows (--from-wiki to
+    Markdown) reuses this client; one is made when omitted.
+
+    ``pin_version`` (--from-wiki to Markdown, which reads the page's HTML
+    too): the page version is read first and the source is fetched at it,
+    and ``session.page_version`` makes the HTML read use it, so a save
+    between the two reads cannot pair one version's source with the next
+    one's HTML. When the version cannot be read, both reads are the
+    unpinned latest and ``session.warnings`` says so.
 
     Returns (text, EXIT_OK) on success or (None, EXIT_TRAC) on any
     failure. Never prints the password.
     """
-    overrides = _build_trac_overrides(args)
-    if overrides is None:
+    session = session or _TracSession(args)
+    try:
+        client = session.client()
+    except TracConnectionRequired as e:
+        sys.stderr.write(
+            "trac-convert: no Trac credentials found.\n"
+            "  Set env vars TRAC_URL, TRAC_USERNAME, TRAC_PASSWORD, or\n"
+            "  create .trac_mcp/config.yaml (see docs/reference/cli.md).\n"
+        )
+        if e.config_error is not None:
+            sys.stderr.write(f"  config error: {e.config_error}\n")
+        return None, EXIT_TRAC
+    except TracRenderError:
         return (
             None,
             EXIT_TRAC,
         )  # password-file diagnostic already written
 
     try:
-        config, _ = bootstrap_config(overrides)
-    except ValueError:
-        sys.stderr.write(
-            "trac-convert: no Trac credentials found.\n"
-            "  Set env vars TRAC_URL, TRAC_USERNAME, TRAC_PASSWORD, or\n"
-            "  create .trac_mcp/config.yaml (see docs/reference/cli.md).\n"
-        )
-        return None, EXIT_TRAC
-
-    client = TracClient(config)
-    try:
-        text = client.get_wiki_page(page_name)
+        if pin_version:
+            session.page_version = _usable_version(
+                client.get_wiki_page_info(page_name)
+            )
+            if session.page_version is None:
+                session.warnings.append(
+                    f"wiki page {page_name}: its version could not be"
+                    " read, so the source and the HTML reads were not"
+                    " pinned to one version; a save between them would"
+                    " pair one version's source with another's HTML"
+                )
+            text = client.get_wiki_page(page_name, session.page_version)
+        else:
+            text = client.get_wiki_page(page_name)
     except Exception as e:
         msg = _classify_trac_error(
-            e, config.trac_url, page_name=page_name, action="wiki fetch"
+            e, session.url, page_name=page_name, action="wiki fetch"
         )
         sys.stderr.write(f"trac-convert: {msg}\n")
         return None, EXIT_TRAC
@@ -432,9 +634,11 @@ def _check_trac(args) -> int:
     Password is NEVER written to stdout or stderr.
 
     All wire errors are routed through the shared error helper with
-    page_name=None and action="Trac ping". The permission-denied branch
-    fires for PERMISSION_DENIED-style faultStrings; the generic fault
-    branch fires for other auth/protocol errors (e.g. Forbidden).
+    page_name=None and action="Trac ping". Faults are classified by
+    ``classify_fault``: a 403 (TracXMLRPC's PermissionError), or a
+    permission word outside any quoted name, gives the
+    permission-denied message; any other fault gives the generic
+    "Trac fault" message.
     """
     overrides = _build_trac_overrides(args)
     if overrides is None:
@@ -471,6 +675,14 @@ def _check_trac(args) -> int:
     return EXIT_OK
 
 
+#: What ``--link-map`` says when the run is not a TracWiki -> Markdown
+#: conversion (including ``--check-trac``, which converts nothing).
+_LINK_MAP_NO_EFFECT = (
+    "--link-map has no effect: it rewrites the links of a"
+    " TracWiki -> Markdown conversion only"
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the argument parser.
 
@@ -478,7 +690,12 @@ def build_parser() -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(
         prog="trac-convert",
-        description="Convert between Markdown and TracWiki formats.",
+        description=(
+            "Convert between Markdown and TracWiki formats. "
+            "TracWiki -> Markdown needs a Trac connection (Trac "
+            "renders the text; trac-convert translates its HTML); "
+            "Markdown -> TracWiki runs offline."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -548,17 +765,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--unknown-macros",
-        dest="unknown_macros",
-        choices=("preserve", "drop"),
-        default="preserve",
+        "--link-map",
+        dest="link_map",
+        action="append",
+        type=link_map_arg,
+        default=None,
+        metavar="FROM=TO",
         help=(
-            "How to render unknown TracWiki macros"
-            " (tracwiki → md only). preserve = leave [[Name]] literal,"
-            " drop = omit. Default: preserve."
-            " (The 'bracket' mode, which emitted [MACRO: Name], was"
-            " removed in ticket #63 -- 'preserve' round-trips back to"
-            " TracWiki unchanged, which 'bracket' only simulated.)"
+            "Rewrite links of a TracWiki -> Markdown conversion: a link"
+            " target starting with FROM has that prefix replaced by TO"
+            " (longest FROM first; images and #anchors are never"
+            " rewritten). Repeatable. Replaces the configured map"
+            " (export.link_rewrites, TRAC_MCP_LINK_REWRITES). Has no"
+            " effect in any other direction."
         ),
     )
     parser.add_argument(
@@ -611,6 +830,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Fetch input from a Trac wiki page (source format is TracWiki). "
             "Mutually exclusive with FILE, --from-file, and --from-clipboard."
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        dest="force",
+        action="store_true",
+        help=(
+            "Convert Markdown exported from Trac (front matter carrying "
+            "trac_page) to TracWiki anyway, stripping that front matter"
         ),
     )
     parser.add_argument(
@@ -669,7 +897,11 @@ def convert_text(
     target_format: str,
     *,
     heading_anchors: bool = False,
-    unknown_macros: str = "preserve",
+    render_html: Callable[[str], str] | None = None,
+    link_map: dict[str, str]
+    | Callable[[], dict[str, str]]
+    | None = None,
+    document_url: str | Callable[[], str | None] | None = None,
 ) -> ConversionResult:
     """Convert text between Markdown and TracWiki.
 
@@ -677,8 +909,21 @@ def convert_text(
     target_format: "md" or "tracwiki".
     heading_anchors: forwarded to convert_with_warnings() for md→tracwiki.
         Ignored on the tracwiki→md direction.
-    unknown_macros: forwarded to tracwiki_to_markdown() for tracwiki→md.
-        Ignored on the md→tracwiki direction.
+    render_html: a callable from TracWiki text to Trac's HTML for it.
+        TracWiki→Markdown translates that HTML
+        (``trac_html_to_markdown(render_html(text), text)``), so it is
+        required there: without one, ``TracConnectionRequired`` is
+        raised. Markdown→TracWiki and pass-through never call it.
+    link_map: URL prefix -> replacement for the links of TracWiki→Markdown
+        (``trac_html_to_markdown(link_map=)``), or a callable returning
+        it, called after ``render_html`` so a map that comes from the
+        Trac session's config can be read once that session is open.
+        Ignored by every other direction.
+    document_url: the URL Trac gives the converted document
+        (``trac_html_to_markdown(document_url=)``), or a callable
+        returning it, called after ``render_html`` like ``link_map``.
+        A link into it with a fragment is written ``#frag`` and never
+        rewritten. Ignored by every other direction.
 
     Returns a ConversionResult (may be a pass-through with
     converted=False when source and target resolve to the same
@@ -718,7 +963,20 @@ def convert_text(
             )
         )
         return result
-    return tracwiki_to_markdown(text, unknown_macros=unknown_macros)  # type: ignore[arg-type]
+    if render_html is None:
+        raise TracConnectionRequired(_TRAC_REQUIRED_MESSAGE)
+    html = render_html(text)
+    result = trac_html_to_markdown(
+        html,
+        text,
+        link_map=link_map() if callable(link_map) else link_map,
+        document_url=(
+            document_url() if callable(document_url) else document_url
+        ),
+    )
+    # The translator reports the format it read (HTML); the caller's
+    # input, and what --verbose reports, is TracWiki.
+    return replace(result, source_format=source)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -742,7 +1000,11 @@ def main(argv: list[str] | None = None) -> int:
       exception; a ``trac-convert: conversion failed: <reason>`` message
       is written to stderr (no traceback).
     - 4 (EXIT_TRAC): Trac connectivity, auth, or protocol error from
-      --check-trac, --from-wiki, or --to-wiki. Sub-classified into:
+      --check-trac, --from-wiki, --to-wiki, or the rendering step of
+      TracWiki -> Markdown (Trac renders the text and trac-convert
+      translates its HTML, Trac /trac_mcp_server #210). TracWiki ->
+      Markdown with no Trac configured also exits 4, with a message
+      saying what to set; nothing is written to stdout. Sub-classified into:
       wiki-page-not-found, permission-denied, timeout, SSL error,
       network unreachable, or generic Trac fault. Password is never
       written to stdout or stderr. With --to-wiki, nothing was stored.
@@ -752,17 +1014,29 @@ def main(argv: list[str] | None = None) -> int:
       (Trac /trac_mcp_server #140).
 
     Note on direction-scoped flags: --heading-anchors only affects the
-    md→tracwiki direction and is silently ignored for tracwiki→md (and
-    vice-versa for --unknown-macros).  This is intentional — --from auto
-    may resolve either way at runtime, so mutual-exclusion checks are not
-    applied.
+    md→tracwiki direction and is silently ignored for tracwiki→md.  This
+    is intentional — --from auto may resolve either way at runtime, so
+    mutual-exclusion checks are not applied. --link-map is the same: it
+    applies to tracwiki→md only, and any other direction prints one
+    ``warning:`` line saying it has no effect (a ``--link-map`` value
+    with no ``=``, an empty FROM or a repeated FROM is a usage error,
+    exit 2).
 
     Note on verbosity flags: --quiet suppresses warning: lines (but not
     trac-convert: errors). --verbose emits info: diagnostic lines (source
     format, byte counts) to stderr before warnings. The two flags are
     mutually exclusive via argparse add_mutually_exclusive_group().
     """
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    link_map_flag: LinkRewrites | None = None
+    if args.link_map is not None:
+        # An empty FROM or a repeated FROM is a usage error too.
+        try:
+            link_map_flag = parse_pairs(args.link_map, "--link-map")
+        except ValueError as e:
+            parser.error(str(e))
 
     # --- --check-trac: early dispatch before conversion validation ---
     if args.check_trac:
@@ -772,6 +1046,8 @@ def main(argv: list[str] | None = None) -> int:
                 " --from-wiki or --to-wiki\n"
             )
             return EXIT_RUNTIME_ERROR
+        if link_map_flag is not None and not args.quiet:
+            sys.stderr.write(f"warning: {_LINK_MAP_NO_EFFECT}\n")
         return _check_trac(args)
 
     # --- --to is required for conversion (not for --check-trac or --to-wiki) ---
@@ -851,8 +1127,22 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_RUNTIME_ERROR
 
     # --- read input ---
+    # One lazily-opened Trac session per run: TracWiki -> Markdown
+    # renders through it, --from-wiki reads through it, and nothing
+    # else touches Trac.
+    session = _TracSession(args)
+    session.explicit_link_map = link_map_flag
     if args.from_wiki is not None:
-        text, fetch_rc = _fetch_wiki_page(args.from_wiki, args)
+        # To Markdown the page's HTML is read too, so both reads are
+        # pinned to one version; --to tracwiki / --to-wiki read no HTML.
+        text, fetch_rc = _fetch_wiki_page(
+            args.from_wiki,
+            args,
+            session,
+            pin_version=(
+                args.to_wiki is None and args.target_format == "md"
+            ),
+        )
         if text is None:
             return fetch_rc
         # --from-wiki authoritatively knows the source is TracWiki;
@@ -890,10 +1180,39 @@ def main(argv: list[str] | None = None) -> int:
     else:
         text = sys.stdin.read()
 
+    # The input as read; --force below replaces ``text`` with the part
+    # after the front matter, but "read N bytes" counts what was read.
+    bytes_read = len(text.encode("utf-8"))
+
     # --- --to-wiki authoritatively knows the target is TracWiki;
     # silently override --to (which may be None or 'md'). ---
     if args.to_wiki is not None:
         args.target_format = "tracwiki"
+
+    # --- Ticket #212: the Markdown export is one-way. Converting text
+    # whose front matter says it came from a Trac page back to TracWiki
+    # (to stdout, a file, the clipboard or --to-wiki) would re-shape the
+    # page, so it is refused before anything is converted or written,
+    # unless forced, which drops that front matter and converts the rest.
+    if args.from_wiki is None and args.target_format == "tracwiki":
+        exported = exported_from(text)
+        if exported:
+            if not args.force:
+                instance = exported.get("trac_instance") or "unknown"
+                version = exported.get("trac_version")
+                if version is None:
+                    version = "unknown"
+                page = exported["trac_page"]
+                sys.stderr.write(
+                    "trac-convert: refusing to convert: this Markdown was "
+                    f"exported from Trac page '{page}' (instance "
+                    f"{instance}, version {version}) and the export is "
+                    "one-way; edit the page as TracWiki (trac-convert "
+                    f"--from-wiki {shlex.quote(page)} --to tracwiki), or pass"
+                    " --force\n"
+                )
+                return EXIT_RUNTIME_ERROR
+            text = split_front_matter(text)[1]
 
     # --- convert ---
     # Translate --heading-anchors on|off to bool before forwarding.
@@ -904,11 +1223,63 @@ def main(argv: list[str] | None = None) -> int:
             args.source_format,
             args.target_format,
             heading_anchors=heading_anchors_bool,
-            unknown_macros=args.unknown_macros,
+            render_html=(
+                session.page_renderer(args.from_wiki)
+                if args.from_wiki is not None
+                else session.render_text
+            ),
+            link_map=session.link_map,
+            document_url=lambda: session.document_url(args.from_wiki),
         )
+    except TracConnectionRequired as e:
+        sys.stderr.write(f"trac-convert: {e}\n")
+        if args.source_format == "auto":
+            # Only an undecided --from reaches here as "auto" (--from-wiki
+            # sets tracwiki): the text may be Markdown that detection
+            # could not tell from TracWiki, e.g. a bare line of prose.
+            sys.stderr.write(
+                "  the input was auto-detected as TracWiki; if it is"
+                " Markdown, pass --from md\n"
+            )
+        return EXIT_TRAC
+    except TracRenderError as e:
+        if str(e):
+            sys.stderr.write(f"trac-convert: {e}\n")
+        return EXIT_TRAC
     except Exception as e:
         sys.stderr.write(f"trac-convert: conversion failed: {e}\n")
         return EXIT_CONVERSION_ERROR
+
+    if link_map_flag is not None and not (
+        result.converted
+        and result.source_format == "tracwiki"
+        and result.target_format == "markdown"
+    ):
+        session.warnings.append(_LINK_MAP_NO_EFFECT)
+
+    if session.warnings:
+        result = replace(
+            result, warnings=[*session.warnings, *result.warnings]
+        )
+
+    # Ticket #212: a Markdown export of a page names the page it came
+    # from, which is what a later push or conversion refuses it by.
+    if (
+        args.from_wiki is not None
+        and result.converted
+        and result.target_format == "markdown"
+    ):
+        result = replace(
+            result,
+            text=build_front_matter(
+                title=result.title or args.from_wiki,
+                source=page_url(session.url, args.from_wiki),
+                trac_instance=instance_path(session.url),
+                trac_page=args.from_wiki,
+                trac_version=session.page_version,
+            )
+            + result.text,
+        )
 
     # --- write output ---
     if args.to_wiki is not None:
@@ -957,9 +1328,7 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(
             f"info: source format: {result.source_format}\n"
         )
-        sys.stderr.write(
-            f"info: read {len(text.encode('utf-8'))} bytes\n"
-        )
+        sys.stderr.write(f"info: read {bytes_read} bytes\n")
         if args.to_wiki is None:
             sys.stderr.write(
                 f"info: wrote {len(result.text.encode('utf-8'))} bytes\n"

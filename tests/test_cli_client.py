@@ -147,7 +147,9 @@ class FakeTrac:
     def __init__(self):
         # write_gate off: the link gate would render through real Trac.
         self.config = SimpleNamespace(
-            trac_url="http://fake/trac_test", write_gate=False
+            trac_url="http://fake/trac_test",
+            write_gate=False,
+            link_rewrites=(),
         )
         self.pages: dict[str, list[str]] = {}
         self.attachments: dict[tuple, bytes] = {}
@@ -278,6 +280,55 @@ class TestRealSubstrate:
             "Updated wiki page 'P'" in printed or "Created" in printed
         )
         assert "[instance:" in printed
+
+    def test_wiki_pull_prints_each_warning_on_stderr_after_the_write(
+        self, tmp_path, capsys
+    ):
+        """``wiki_file_pull`` returns the translator's (and the pin's)
+        warnings in structuredContent; the CLI prints each as a
+        ``trac-mcp: warning:`` line on stderr, and the file is written
+        and the exit is 0 all the same."""
+
+        class _Html(FakeTrac):
+            def get_wiki_page_html(self, name, version=None):
+                return (
+                    '<h1 id="T">T</h1>\n'
+                    '<form action="/search"><input name="q"></form>\n'
+                )
+
+        trac = _Html()
+        trac.pages["P"] = ["= T =\n"]
+        out = tmp_path / "out.md"
+        with _served(trac) as url:
+            rc = _cli(url, "wiki-pull", "P", str(out))
+        assert rc == cli.EXIT_OK
+        written = out.read_text()
+        assert written.startswith('---\ntitle: "T"\n')
+        assert "\n---\n\n# T" in written
+        captured = capsys.readouterr()
+        lines = [
+            ln
+            for ln in captured.err.splitlines()
+            if ln.startswith("trac-mcp: warning: ")
+        ]
+        assert len(lines) >= 1
+        assert any("form" in ln for ln in lines), captured.err
+        # stdout keeps only the status line, with no warning text.
+        assert "warning" not in captured.out
+        assert "Pulled wiki page 'P'" in captured.out
+
+    def test_wiki_pull_without_warnings_prints_none(
+        self, tmp_path, capsys
+    ):
+        trac = FakeTrac()
+        trac.pages["P"] = ["= T =\n"]
+        out = tmp_path / "out.wiki"
+        with _served(trac) as url:
+            rc = _cli(
+                url, "wiki-pull", "P", str(out), "--format", "tracwiki"
+            )
+        assert rc == cli.EXIT_OK
+        assert "warning" not in capsys.readouterr().err
 
     def test_wiki_push_stored_but_readback_failed_exits_4_not_1(
         self, tmp_path, capsys
@@ -493,8 +544,8 @@ def test_live_cli_roundtrip_through_real_server(tmp_path):
     import os
     import uuid
 
+    from tests.live_helpers import trac_test_registry
     from trac_mcp_server.config import Config
-    from trac_mcp_server.instances import InstanceRegistry
 
     default_config = Config(
         trac_url=os.environ["TRAC_URL"],
@@ -515,7 +566,7 @@ def test_live_cli_roundtrip_through_real_server(tmp_path):
     blob.write_bytes(bytes(range(256)) * 16)
     instance = ["--instance", "/trac_test"]
 
-    with _served_instances(InstanceRegistry(default_config, {})) as url:
+    with _served_instances(trac_test_registry(default_config)) as url:
         try:
             assert (
                 _cli(url, *instance, "wiki-push", page, str(src))
